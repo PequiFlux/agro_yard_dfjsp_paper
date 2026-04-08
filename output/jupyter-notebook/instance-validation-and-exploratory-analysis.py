@@ -53,7 +53,7 @@ import seaborn as sns
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import roc_auc_score
 from sklearn.model_selection import StratifiedKFold, cross_val_predict, cross_val_score
-from IPython.display import Markdown, display
+from IPython.display import Image, Markdown, display
 
 if NON_INTERACTIVE_CLI:
     plt.show = lambda *args, **kwargs: None
@@ -88,6 +88,807 @@ import exact_solver_smoke as solver_smoke
 observed_release_builder = importlib.reload(observed_release_builder)
 repl = importlib.reload(repl)
 solver_smoke = importlib.reload(solver_smoke)
+
+import json
+import math
+import time
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
+
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+import seaborn as sns
+import hdbscan
+import shap
+from scipy.spatial import ConvexHull
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.metrics import accuracy_score, balanced_accuracy_score, f1_score
+from sklearn.tree import DecisionTreeClassifier
+from lightgbm import LGBMClassifier
+from umap import UMAP
+
+
+SEED = 7
+METHOD_ORDER = [
+    "M0_FIFO_OFFICIAL",
+    "M1_WEIGHTED_SLACK",
+    "M2_PERIODIC_15",
+    "M2_PERIODIC_30",
+    "M3_EVENT_REACTIVE",
+]
+METHOD_LABELS = {
+    "M0_FIFO_OFFICIAL": "M0 FIFO oficial",
+    "M1_WEIGHTED_SLACK": "M1 Weighted Slack",
+    "M2_PERIODIC_15": "M2 Periódico Δ=15",
+    "M2_PERIODIC_30": "M2 Periódico Δ=30",
+    "M3_EVENT_REACTIVE": "M3 Evento reativo",
+}
+UTILITY_WEIGHTS = {
+    "flow_p95": 0.45,
+    "flow_mean": 0.25,
+    "makespan": 0.15,
+    "weighted_tardiness": 0.10,
+    "runtime_sec": 0.05,
+}
+FIGURE_NAMES = {
+    "method_delta": "method_delta_vs_fifo.png",
+    "method_runtime": "method_runtime_heatmap.png",
+    "umap_best_method": "umap_best_method.png",
+    "hdbscan_clusters": "hdbscan_clusters.png",
+    "solver_footprints": "solver_footprints.png",
+    "selector_shap": "selector_shap.png",
+}
+
+
+@dataclass(frozen=True)
+class MethodSpec:
+    method_name: str
+    family: str
+    delta_min: int | None = None
+
+
+METHOD_SPECS = {
+    "M1_WEIGHTED_SLACK": MethodSpec("M1_WEIGHTED_SLACK", "static"),
+    "M2_PERIODIC_15": MethodSpec("M2_PERIODIC_15", "periodic", delta_min=15),
+    "M2_PERIODIC_30": MethodSpec("M2_PERIODIC_30", "periodic", delta_min=30),
+    "M3_EVENT_REACTIVE": MethodSpec("M3_EVENT_REACTIVE", "event"),
+}
+
+
+def _ensure_dir(path: Path) -> Path:
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def _load_instance_tables(root: Path, instance_id: str) -> dict[str, pd.DataFrame]:
+    inst_dir = root / "instances" / instance_id
+    return {
+        "jobs": pd.read_csv(inst_dir / "jobs.csv"),
+        "operations": pd.read_csv(inst_dir / "operations.csv"),
+        "eligible": pd.read_csv(inst_dir / "eligible_machines.csv"),
+        "machines": pd.read_csv(inst_dir / "machines.csv"),
+        "downtimes": pd.read_csv(inst_dir / "machine_downtimes.csv"),
+        "events": pd.read_csv(inst_dir / "events.csv"),
+        "fifo_schedule": pd.read_csv(inst_dir / "fifo_schedule.csv"),
+        "fifo_job_metrics": pd.read_csv(inst_dir / "fifo_job_metrics.csv"),
+        "fifo_summary": pd.DataFrame([json.loads((inst_dir / "fifo_summary.json").read_text(encoding="utf-8"))]),
+    }
+
+
+def _entropy(series: pd.Series) -> float:
+    probs = series.value_counts(normalize=True)
+    if probs.empty:
+        return 0.0
+    return float(-(probs * np.log2(probs + 1e-12)).sum())
+
+
+def build_paper_feature_frame(ctx: dict[str, Any]) -> pd.DataFrame:
+    base = ctx["instance_space_features"].copy()
+    jobs = ctx["jobs_enriched"].copy()
+    events = ctx["events"].copy()
+    eligible = ctx["eligible"].copy()
+    downtimes = ctx["downtimes"].copy()
+
+    due_stats = jobs.groupby("instance_id", as_index=False).agg(
+        due_slack_mean=("due_slack_min", "mean"),
+        due_slack_std=("due_slack_min", "std"),
+        due_slack_p10=("due_slack_min", lambda s: float(np.quantile(s, 0.10))),
+        due_slack_p90=("due_slack_min", lambda s: float(np.quantile(s, 0.90))),
+        urgent_share=("priority_class", lambda s: float(s.eq("URGENT").mean())),
+        appointment_share=("appointment_flag", "mean"),
+        commodity_entropy=("commodity", _entropy),
+        moisture_entropy=("moisture_class", _entropy),
+        wet_share=("moisture_class", lambda s: float(s.eq("WET").mean())),
+    )
+    event_stats = (
+        events.sort_values(["instance_id", "event_time_min"])
+        .groupby("instance_id", as_index=False)
+        .agg(
+            event_count=("event_type", "count"),
+            first_event_min=("event_time_min", "min"),
+            last_event_min=("event_time_min", "max"),
+            visible_jobs_at_t0=("event_time_min", lambda s: int((s == 0).sum())),
+        )
+    )
+    inter_event = (
+        events.sort_values(["instance_id", "event_time_min"])
+        .groupby("instance_id")["event_time_min"]
+        .apply(lambda s: pd.Series(np.diff(s.to_numpy(dtype=float))).describe())
+        .unstack()
+        .reset_index()
+        .rename(columns={"mean": "inter_event_mean", "std": "inter_event_std"})
+    )
+    compatibility = (
+        eligible.groupby("instance_id", as_index=False)
+        .agg(
+            compatibility_density=("machine_id", "count"),
+            proc_time_cv=("proc_time_min", lambda s: float(s.std(ddof=0) / max(s.mean(), 1e-6))),
+        )
+    )
+    compat_denominator = (base["n_jobs"] * 4 * base["machine_count"]).replace(0, 1.0)
+    downtime_by_machine = (
+        downtimes.assign(duration_min=downtimes["end_min"] - downtimes["start_min"])
+        .groupby(["instance_id", "machine_id"], as_index=False)["duration_min"]
+        .sum()
+        .groupby("instance_id", as_index=False)
+        .agg(
+            downtime_total_min=("duration_min", "sum"),
+            downtime_max_machine_share=("duration_min", lambda s: float(s.max() / max(s.sum(), 1e-6))),
+        )
+    )
+
+    frame = (
+        base.merge(due_stats, on="instance_id", how="left")
+        .merge(event_stats, on="instance_id", how="left")
+        .merge(inter_event[["instance_id", "inter_event_mean", "inter_event_std"]], on="instance_id", how="left")
+        .merge(compatibility, on="instance_id", how="left")
+        .merge(downtime_by_machine, on="instance_id", how="left")
+    )
+    frame["compatibility_density"] = frame["compatibility_density"] / compat_denominator
+    frame["visible_jobs_fraction_t0"] = frame["visible_jobs_at_t0"] / frame["n_jobs"].replace(0, 1.0)
+    frame["reveal_span_min"] = frame["last_event_min"] - frame["first_event_min"]
+    frame["bottleneck_utilization"] = frame[
+        ["wb_utilization_mean", "lab_utilization_mean", "hop_utilization_mean"]
+    ].max(axis=1)
+    frame["bottleneck_machine_family"] = (
+        frame[["wb_utilization_mean", "lab_utilization_mean", "hop_utilization_mean"]]
+        .idxmax(axis=1)
+        .map(
+            {
+                "wb_utilization_mean": "WB",
+                "lab_utilization_mean": "LAB",
+                "hop_utilization_mean": "HOP",
+            }
+        )
+    )
+    frame["size_hint"] = frame["scale_code"].map({"XS": 0, "S": 1, "M": 2, "L": 3}).fillna(-1)
+    frame["regime_hint"] = frame["regime_code"].map({"balanced": 0, "peak": 1, "disrupted": 2}).fillna(-1)
+    frame = frame.fillna(0.0)
+    return frame.sort_values(["scale_code", "regime_code", "replicate"]).reset_index(drop=True)
+
+
+def _build_job_order(instance: dict[str, pd.DataFrame], method_name: str) -> list[str]:
+    jobs = instance["jobs"].copy()
+    eligible = instance["eligible"].copy()
+
+    nominal_lb = (
+        eligible.groupby(["job_id", "op_seq"], as_index=False)["proc_time_min"]
+        .min()
+        .groupby("job_id", as_index=False)["proc_time_min"]
+        .sum()
+        .rename(columns={"proc_time_min": "nominal_lb_min"})
+    )
+    jobs = jobs.merge(nominal_lb, on="job_id", how="left")
+    jobs["weighted_slack"] = (
+        jobs["completion_due_min"] - jobs["arrival_time_min"] - jobs["nominal_lb_min"]
+    ) / jobs["priority_weight"].replace(0.0, 1.0)
+    jobs["reactive_urgency"] = (
+        jobs["completion_due_min"] - jobs["reveal_time_min"] - jobs["nominal_lb_min"]
+    ) / jobs["priority_weight"].replace(0.0, 1.0)
+
+    if method_name == "M1_WEIGHTED_SLACK":
+        order = jobs.sort_values(
+            ["weighted_slack", "priority_weight", "arrival_time_min", "job_id"],
+            ascending=[True, False, True, True],
+        )
+    elif method_name == "M2_PERIODIC_15":
+        order = jobs.assign(period_bucket=(jobs["reveal_time_min"] // 15).astype(int)).sort_values(
+            ["period_bucket", "weighted_slack", "arrival_congestion_score", "arrival_time_min", "job_id"],
+            ascending=[True, True, False, True, True],
+        )
+    elif method_name == "M2_PERIODIC_30":
+        order = jobs.assign(period_bucket=(jobs["reveal_time_min"] // 30).astype(int)).sort_values(
+            ["period_bucket", "weighted_slack", "arrival_congestion_score", "arrival_time_min", "job_id"],
+            ascending=[True, True, False, True, True],
+        )
+    elif method_name == "M3_EVENT_REACTIVE":
+        order = jobs.sort_values(
+            ["reveal_time_min", "reactive_urgency", "arrival_congestion_score", "arrival_time_min", "job_id"],
+            ascending=[True, True, False, True, True],
+        )
+    else:
+        raise ValueError(f"Unsupported method: {method_name}")
+
+    return order["job_id"].tolist()
+
+
+def _find_earliest_machine_slot(
+    machine_id: str,
+    machine_available: dict[str, float],
+    machine_windows: dict[str, list[tuple[float, float]]],
+    ready_min: float,
+    duration_min: float,
+    machine_end: dict[str, float],
+) -> float | None:
+    start = max(float(ready_min), float(machine_available[machine_id]))
+    for down_start, down_end in machine_windows.get(machine_id, []):
+        if start >= down_end:
+            continue
+        if start + duration_min <= down_start:
+            break
+        start = max(start, down_end)
+    return float(start)
+
+
+def _schedule_jobs_by_policy(root: Path, instance_id: str, method_name: str) -> tuple[pd.DataFrame, dict[str, Any]]:
+    instance = _load_instance_tables(root, instance_id)
+    jobs = instance["jobs"].copy()
+    ops = instance["operations"].copy().sort_values(["job_id", "op_seq"])
+    eligible = instance["eligible"].copy()
+    machines = instance["machines"].copy()
+    downtimes = instance["downtimes"].copy()
+
+    job_order = _build_job_order(instance, method_name)
+    job_index = {job_id: idx for idx, job_id in enumerate(job_order)}
+
+    machine_available = dict(zip(machines["machine_id"], machines["availability_start_min"].astype(float)))
+    machine_end = dict(zip(machines["machine_id"], machines["availability_end_min"].astype(float)))
+    machine_windows = {
+        machine_id: sorted(
+            list(
+                downtimes.loc[downtimes["machine_id"].eq(machine_id), ["start_min", "end_min"]]
+                .itertuples(index=False, name=None)
+            )
+        )
+        for machine_id in machines["machine_id"]
+    }
+
+    scheduled_rows: list[dict[str, Any]] = []
+    job_completion: dict[str, float] = {}
+    queue_minutes: dict[str, float] = {job_id: 0.0 for job_id in job_order}
+
+    started = time.perf_counter()
+    for job_id in job_order:
+        job_row = jobs.loc[jobs["job_id"].eq(job_id)].iloc[0]
+        ready_min = float(max(job_row["arrival_time_min"], job_row["reveal_time_min"]))
+        job_ops = ops.loc[ops["job_id"].eq(job_id)].sort_values("op_seq")
+        for op_row in job_ops.itertuples(index=False):
+            op_ready = max(ready_min, float(op_row.release_time_min))
+            eligible_rows = eligible.loc[
+                eligible["job_id"].eq(job_id) & eligible["op_seq"].eq(op_row.op_seq)
+            ].copy()
+            choices = []
+            for elig_row in eligible_rows.itertuples(index=False):
+                start_min = _find_earliest_machine_slot(
+                    machine_id=elig_row.machine_id,
+                    machine_available=machine_available,
+                    machine_windows=machine_windows,
+                    ready_min=op_ready,
+                    duration_min=float(elig_row.proc_time_min),
+                    machine_end=machine_end,
+                )
+                if start_min is None:
+                    continue
+                end_min = start_min + float(elig_row.proc_time_min)
+                choices.append(
+                    (
+                        end_min,
+                        start_min,
+                        float(elig_row.proc_time_min),
+                        elig_row.machine_id,
+                    )
+                )
+            if not choices:
+                raise RuntimeError(f"No feasible machine choice for {instance_id} {job_id} op {op_row.op_seq}.")
+            _, start_min, proc_time_min, machine_id = min(choices)
+            end_min = start_min + proc_time_min
+            machine_available[machine_id] = end_min
+            queue_minutes[job_id] += max(0.0, start_min - op_ready)
+            scheduled_rows.append(
+                {
+                    "instance_id": instance_id,
+                    "job_id": job_id,
+                    "job_rank": job_index[job_id],
+                    "op_seq": int(op_row.op_seq),
+                    "stage_name": op_row.stage_name,
+                    "machine_id": machine_id,
+                    "start_min": float(start_min),
+                    "end_min": float(end_min),
+                    "wait_before_stage_min": float(max(0.0, start_min - op_ready)),
+                    "policy_method": method_name,
+                }
+            )
+            ready_min = end_min
+        job_completion[job_id] = ready_min
+    runtime_sec = time.perf_counter() - started
+
+    schedule = pd.DataFrame(scheduled_rows).sort_values(["start_min", "end_min", "job_id", "op_seq"]).reset_index(drop=True)
+    job_metrics = jobs[["job_id", "arrival_time_min", "completion_due_min", "priority_weight", "statutory_wait_limit_min"]].copy()
+    job_metrics["completion_min"] = job_metrics["job_id"].map(job_completion)
+    job_metrics["flow_time_min"] = job_metrics["completion_min"] - job_metrics["arrival_time_min"]
+    job_metrics["queue_time_min"] = job_metrics["job_id"].map(queue_minutes)
+    job_metrics["overwait_min"] = np.maximum(
+        job_metrics["queue_time_min"] - job_metrics["statutory_wait_limit_min"], 0.0
+    )
+    job_metrics["tardiness_min"] = np.maximum(
+        job_metrics["completion_min"] - job_metrics["completion_due_min"], 0.0
+    )
+    summary = {
+        "instance_id": instance_id,
+        "method_name": method_name,
+        "runtime_sec": float(runtime_sec),
+        "makespan": float(job_metrics["completion_min"].max()),
+        "flow_mean": float(job_metrics["flow_time_min"].mean()),
+        "flow_p95": float(np.quantile(job_metrics["flow_time_min"], 0.95)),
+        "queue_mean": float(job_metrics["queue_time_min"].mean()),
+        "queue_p95": float(np.quantile(job_metrics["queue_time_min"], 0.95)),
+        "weighted_tardiness": float((job_metrics["tardiness_min"] * job_metrics["priority_weight"]).sum()),
+        "replan_count": int(max(1, jobs["reveal_time_min"].nunique())),
+        "solver_status": "heuristic_feasible",
+    }
+    if method_name.startswith("M2_PERIODIC"):
+        delta = METHOD_SPECS[method_name].delta_min or 15
+        summary["replan_count"] = int(jobs["reveal_time_min"].floordiv(delta).nunique())
+    elif method_name == "M1_WEIGHTED_SLACK":
+        summary["replan_count"] = 1
+    return schedule, summary
+
+
+def build_method_performance_matrix(root: Path, ctx: dict[str, Any]) -> tuple[pd.DataFrame, dict[str, pd.DataFrame]]:
+    catalog = ctx["catalog"][["instance_id", "scale_code", "regime_code", "replicate"]].copy()
+    official_job_metrics = ctx["job_metrics"].copy()
+    official_schedule = ctx["schedule"].copy()
+    official_summary = (
+        official_job_metrics.groupby("instance_id", as_index=False)
+        .agg(
+            flow_mean=("flow_time_min", "mean"),
+            flow_p95=("flow_time_min", lambda s: float(np.quantile(s, 0.95))),
+            queue_mean=("queue_time_min", "mean"),
+            queue_p95=("queue_time_min", lambda s: float(np.quantile(s, 0.95))),
+            makespan=("completion_min", "max"),
+            weighted_tardiness=("overwait_min", "sum"),
+        )
+        .assign(runtime_sec=0.0, replan_count=1, solver_status="official_release", method_name="M0_FIFO_OFFICIAL")
+    )
+
+    long_rows = [official_summary.merge(catalog, on="instance_id", how="left")]
+    schedules = {"M0_FIFO_OFFICIAL": official_schedule.copy()}
+
+    for method_name in METHOD_SPECS:
+        summary_rows = []
+        schedule_rows = []
+        for instance_id in catalog["instance_id"].tolist():
+            schedule, summary = _schedule_jobs_by_policy(root=root, instance_id=instance_id, method_name=method_name)
+            summary_rows.append(summary)
+            schedule_rows.append(schedule)
+        method_df = pd.DataFrame(summary_rows).merge(catalog, on="instance_id", how="left")
+        long_rows.append(method_df)
+        schedules[method_name] = pd.concat(schedule_rows, ignore_index=True)
+
+    performance = pd.concat(long_rows, ignore_index=True)
+    fifo_baseline = (
+        performance.loc[performance["method_name"].eq("M0_FIFO_OFFICIAL"), ["instance_id", "flow_mean", "flow_p95", "makespan"]]
+        .rename(
+            columns={
+                "flow_mean": "fifo_flow_mean",
+                "flow_p95": "fifo_flow_p95",
+                "makespan": "fifo_makespan",
+            }
+        )
+    )
+    performance = performance.merge(fifo_baseline, on="instance_id", how="left")
+    performance["delta_vs_fifo_mean_flow_pct"] = (
+        performance["flow_mean"] - performance["fifo_flow_mean"]
+    ) / performance["fifo_flow_mean"].replace(0.0, np.nan)
+    performance["delta_vs_fifo_p95_flow_pct"] = (
+        performance["flow_p95"] - performance["fifo_flow_p95"]
+    ) / performance["fifo_flow_p95"].replace(0.0, np.nan)
+    performance["delta_vs_fifo_makespan_pct"] = (
+        performance["makespan"] - performance["fifo_makespan"]
+    ) / performance["fifo_makespan"].replace(0.0, np.nan)
+    performance = performance.sort_values(["instance_id", "method_name"]).reset_index(drop=True)
+    return performance, schedules
+
+
+def add_utility_and_difficulty(performance: pd.DataFrame) -> pd.DataFrame:
+    frame = performance.copy()
+    utility_parts = []
+    for instance_id, group in frame.groupby("instance_id"):
+        group = group.copy()
+        for metric_name in UTILITY_WEIGHTS:
+            values = group[metric_name].astype(float)
+            min_v = float(values.min())
+            max_v = float(values.max())
+            if math.isclose(max_v, min_v):
+                group[f"{metric_name}_norm"] = 0.0
+            else:
+                group[f"{metric_name}_norm"] = (values - min_v) / (max_v - min_v)
+        group["utility"] = sum(group[f"{metric}_norm"] * weight for metric, weight in UTILITY_WEIGHTS.items())
+        best = float(group["utility"].min())
+        group["regret"] = group["utility"] - best
+        utility_parts.append(group)
+    frame = pd.concat(utility_parts, ignore_index=True)
+    best_by_instance = (
+        frame.sort_values(["instance_id", "utility", "runtime_sec", "method_name"])
+        .groupby("instance_id", as_index=False)
+        .first()[["instance_id", "method_name", "utility"]]
+        .rename(columns={"method_name": "best_method", "utility": "best_utility"})
+    )
+    frame = frame.merge(best_by_instance, on="instance_id", how="left")
+    best_utility_by_instance = frame[["instance_id", "best_utility"]].drop_duplicates()
+    q1 = float(best_utility_by_instance["best_utility"].quantile(1 / 3))
+    q2 = float(best_utility_by_instance["best_utility"].quantile(2 / 3))
+    difficulty_map = {}
+    for row in best_utility_by_instance.itertuples(index=False):
+        if row.best_utility <= q1:
+            difficulty_map[row.instance_id] = "easy"
+        elif row.best_utility <= q2:
+            difficulty_map[row.instance_id] = "medium"
+        else:
+            difficulty_map[row.instance_id] = "hard"
+    frame["difficulty"] = frame["instance_id"].map(difficulty_map)
+    frame["footprint_member"] = frame["regret"] <= 0.15
+    return frame
+
+
+def _numeric_feature_columns(feature_frame: pd.DataFrame) -> list[str]:
+    blocked = {
+        "instance_id",
+        "core_instance_digest",
+        "nearest_neighbor_instance_id",
+        "scale_code",
+        "regime_code",
+        "bottleneck_machine_family",
+    }
+    return [
+        column
+        for column in feature_frame.columns
+        if column not in blocked and pd.api.types.is_numeric_dtype(feature_frame[column])
+    ]
+
+
+def build_umap_hdbscan_frame(feature_frame: pd.DataFrame, best_method_df: pd.DataFrame) -> pd.DataFrame:
+    frame = feature_frame.copy()
+    numeric_cols = _numeric_feature_columns(frame)
+    matrix = frame[numeric_cols].astype(float).to_numpy()
+    means = matrix.mean(axis=0)
+    stds = matrix.std(axis=0, ddof=0)
+    stds[stds == 0] = 1.0
+    matrix = (matrix - means) / stds
+    umap = UMAP(n_neighbors=min(10, len(frame) - 1), min_dist=0.15, random_state=SEED)
+    embedding = umap.fit_transform(matrix)
+    clusterer = hdbscan.HDBSCAN(min_cluster_size=3, min_samples=2)
+    clusters = clusterer.fit_predict(embedding)
+    frame["umap_x"] = embedding[:, 0]
+    frame["umap_y"] = embedding[:, 1]
+    frame["cluster_label"] = clusters
+    frame = frame.merge(best_method_df[["instance_id", "best_method", "difficulty"]], on="instance_id", how="left")
+    return frame
+
+
+def build_selector_results(feature_frame: pd.DataFrame, best_method_df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
+    data = feature_frame.merge(best_method_df[["instance_id", "best_method", "difficulty"]], on="instance_id", how="left")
+    numeric_cols = _numeric_feature_columns(data)
+    X = data[numeric_cols].astype(float).to_numpy()
+    y = data["best_method"].astype(str).to_numpy()
+    classes = sorted(pd.unique(y).tolist())
+    class_to_int = {label: idx for idx, label in enumerate(classes)}
+    y_int = np.array([class_to_int[label] for label in y], dtype=int)
+
+    estimators: list[tuple[str, Any]] = [
+        ("decision_tree", DecisionTreeClassifier(max_depth=4, random_state=SEED)),
+        ("random_forest", RandomForestClassifier(n_estimators=300, random_state=SEED, min_samples_leaf=2)),
+    ]
+    if LGBMClassifier is not None:
+        estimators.append(
+            (
+                "lightgbm",
+                LGBMClassifier(
+                    n_estimators=150,
+                    learning_rate=0.05,
+                    random_state=SEED,
+                    verbosity=-1,
+                ),
+            )
+        )
+
+    rows = []
+    best_model_name = None
+    best_predictions = None
+    best_estimator = None
+    best_score = -np.inf
+    for model_name, estimator in estimators:
+        predictions = []
+        for idx in range(len(data)):
+            train_mask = np.ones(len(data), dtype=bool)
+            train_mask[idx] = False
+            estimator.fit(X[train_mask], y_int[train_mask])
+            pred_idx = int(estimator.predict(X[idx : idx + 1])[0])
+            predictions.append(classes[pred_idx])
+        predictions = np.array(predictions)
+        acc = accuracy_score(y, predictions)
+        macro_f1 = f1_score(y, predictions, average="macro")
+        bal_acc = balanced_accuracy_score(y, predictions)
+        rows.append(
+            {
+                "model_name": model_name,
+                "top1_accuracy": float(acc),
+                "macro_f1": float(macro_f1),
+                "balanced_accuracy": float(bal_acc),
+            }
+        )
+        composite = acc + macro_f1
+        if composite > best_score:
+            best_score = composite
+            best_model_name = model_name
+            best_predictions = predictions
+            best_estimator = estimator
+
+    report = pd.DataFrame(rows).sort_values(["top1_accuracy", "macro_f1"], ascending=False).reset_index(drop=True)
+    best_estimator.fit(X, y_int)
+    explainer = shap.TreeExplainer(best_estimator)
+    shap_values = explainer.shap_values(X)
+    if isinstance(shap_values, list):
+        shap_importance = np.mean([np.abs(value) for value in shap_values], axis=0)
+    elif np.asarray(shap_values).ndim == 3:
+        shap_importance = np.abs(np.asarray(shap_values)).mean(axis=0)
+    else:
+        shap_importance = np.abs(np.asarray(shap_values))
+    mean_abs = np.asarray(shap_importance).mean(axis=0)
+    shap_summary = pd.DataFrame(
+        {
+            "feature_name": numeric_cols,
+            "mean_abs_shap": mean_abs,
+            "selected_model": best_model_name,
+        }
+    ).sort_values("mean_abs_shap", ascending=False)
+    return report, shap_summary.reset_index(drop=True)
+
+
+def export_aslib_scenario(feature_frame: pd.DataFrame, performance: pd.DataFrame, out_dir: Path) -> dict[str, Path]:
+    _ensure_dir(out_dir)
+    numeric_cols = _numeric_feature_columns(feature_frame)
+    features = feature_frame[["instance_id"] + numeric_cols].copy()
+    performance_wide = (
+        performance.pivot(index="instance_id", columns="method_name", values="utility")
+        .reset_index()
+        .rename_axis(columns=None)
+    )
+    runstatus_wide = (
+        performance.assign(runstatus="ok")
+        .pivot(index="instance_id", columns="method_name", values="runstatus")
+        .reset_index()
+        .rename_axis(columns=None)
+    )
+    feature_costs = pd.DataFrame(
+        {
+            "feature_name": numeric_cols,
+            "cost_sec": [0.001] * len(numeric_cols),
+        }
+    )
+    cv = feature_frame[["instance_id", "replicate", "scale_code", "regime_code"]].copy()
+    cv["fold"] = cv["replicate"].astype(int)
+    paths = {
+        "features": out_dir / "features.csv",
+        "performance": out_dir / "performance.csv",
+        "runstatus": out_dir / "runstatus.csv",
+        "feature_costs": out_dir / "feature_costs.csv",
+        "cv": out_dir / "cv.csv",
+    }
+    features.to_csv(paths["features"], index=False)
+    performance_wide.to_csv(paths["performance"], index=False)
+    runstatus_wide.to_csv(paths["runstatus"], index=False)
+    feature_costs.to_csv(paths["feature_costs"], index=False)
+    cv.to_csv(paths["cv"], index=False)
+    return paths
+
+
+def build_scorecard(ctx: dict[str, Any], performance: pd.DataFrame, selector_report: pd.DataFrame) -> pd.DataFrame:
+    summary = ctx["summary"]
+    best_methods = performance[["instance_id", "best_method"]].drop_duplicates()
+    return pd.DataFrame(
+        [
+            {"metric_name": "structural_pass_rate", "metric_value": summary["structural_pass_rate"]},
+            {"metric_name": "release_consistency_checks_pass", "metric_value": float(summary["release_consistency_checks_pass"])},
+            {"metric_name": "flow_regime_order_checks_pass", "metric_value": float(summary["flow_regime_order_checks_pass"])},
+            {"metric_name": "instance_space_exact_duplicate_checks_pass", "metric_value": float(summary["instance_space_exact_duplicate_checks_pass"])},
+            {"metric_name": "method_count", "metric_value": float(performance["method_name"].nunique())},
+            {"metric_name": "best_method_diversity", "metric_value": float(best_methods["best_method"].nunique())},
+            {"metric_name": "selector_top1_accuracy", "metric_value": float(selector_report.loc[0, "top1_accuracy"])},
+            {"metric_name": "selector_macro_f1", "metric_value": float(selector_report.loc[0, "macro_f1"])},
+        ]
+    )
+
+
+def _plot_method_delta(performance: pd.DataFrame, figure_dir: Path) -> Path:
+    summary = (
+        performance.groupby(["method_name", "scale_code"], as_index=False)["delta_vs_fifo_p95_flow_pct"]
+        .mean()
+        .pivot(index="method_name", columns="scale_code", values="delta_vs_fifo_p95_flow_pct")
+        .reindex(index=METHOD_ORDER, columns=["XS", "S", "M", "L"])
+    )
+    fig, ax = plt.subplots(figsize=(10, 5))
+    sns.heatmap(summary * 100.0, annot=True, fmt=".1f", cmap="RdYlGn_r", center=0.0, ax=ax, cbar_kws={"label": "% vs FIFO"})
+    ax.set_title("Ganho relativo em p95_flow vs FIFO")
+    ax.set_xlabel("Escala")
+    ax.set_ylabel("Método")
+    path = figure_dir / FIGURE_NAMES["method_delta"]
+    fig.tight_layout()
+    fig.savefig(path, dpi=160, bbox_inches="tight")
+    plt.close(fig)
+    return path
+
+
+def _plot_method_runtime(performance: pd.DataFrame, figure_dir: Path) -> Path:
+    runtime = (
+        performance.pivot(index="instance_id", columns="method_name", values="runtime_sec")
+        .reindex(columns=METHOD_ORDER)
+        .fillna(0.0)
+    )
+    fig, ax = plt.subplots(figsize=(11, 8))
+    sns.heatmap(np.log1p(runtime), cmap="mako", ax=ax, cbar_kws={"label": "log(1 + runtime_sec)"})
+    ax.set_title("Runtime por instância × método")
+    path = figure_dir / FIGURE_NAMES["method_runtime"]
+    fig.tight_layout()
+    fig.savefig(path, dpi=160, bbox_inches="tight")
+    plt.close(fig)
+    return path
+
+
+def _plot_umap_best_method(umap_frame: pd.DataFrame, figure_dir: Path) -> Path:
+    fig, ax = plt.subplots(figsize=(10, 7))
+    sns.scatterplot(
+        data=umap_frame,
+        x="umap_x",
+        y="umap_y",
+        hue="best_method",
+        style="regime_code",
+        s=110,
+        ax=ax,
+    )
+    ax.set_title("UMAP do espaço de instâncias colorido pelo melhor método")
+    path = figure_dir / FIGURE_NAMES["umap_best_method"]
+    fig.tight_layout()
+    fig.savefig(path, dpi=160, bbox_inches="tight")
+    plt.close(fig)
+    return path
+
+
+def _plot_hdbscan_clusters(umap_frame: pd.DataFrame, figure_dir: Path) -> Path:
+    fig, ax = plt.subplots(figsize=(10, 7))
+    sns.scatterplot(
+        data=umap_frame,
+        x="umap_x",
+        y="umap_y",
+        hue="cluster_label",
+        style="difficulty",
+        s=110,
+        palette="tab10",
+        ax=ax,
+    )
+    ax.set_title("HDBSCAN sobre o embedding UMAP")
+    path = figure_dir / FIGURE_NAMES["hdbscan_clusters"]
+    fig.tight_layout()
+    fig.savefig(path, dpi=160, bbox_inches="tight")
+    plt.close(fig)
+    return path
+
+
+def _plot_solver_footprints(umap_frame: pd.DataFrame, performance: pd.DataFrame, figure_dir: Path) -> Path:
+    fig, ax = plt.subplots(figsize=(10, 7))
+    sns.scatterplot(data=umap_frame, x="umap_x", y="umap_y", color="#cbd5e1", s=55, ax=ax)
+    footprint_members = performance.loc[performance["footprint_member"]].merge(
+        umap_frame[["instance_id", "umap_x", "umap_y"]], on="instance_id", how="left"
+    )
+    palette = sns.color_palette("Set2", n_colors=len(METHOD_ORDER))
+    for color, method_name in zip(palette, METHOD_ORDER):
+        subset = footprint_members.loc[footprint_members["method_name"].eq(method_name)].copy()
+        if subset.empty:
+            continue
+        sns.scatterplot(
+            data=subset,
+            x="umap_x",
+            y="umap_y",
+            s=130,
+            color=color,
+            label=METHOD_LABELS[method_name],
+            ax=ax,
+        )
+        if len(subset) >= 3:
+            points = subset[["umap_x", "umap_y"]].to_numpy()
+            hull = ConvexHull(points)
+            hull_points = points[hull.vertices]
+            hull_points = np.vstack([hull_points, hull_points[0]])
+            ax.plot(hull_points[:, 0], hull_points[:, 1], color=color, linewidth=1.6, alpha=0.85)
+    ax.set_title("Solver footprints no espaço UMAP")
+    path = figure_dir / FIGURE_NAMES["solver_footprints"]
+    fig.tight_layout()
+    fig.savefig(path, dpi=160, bbox_inches="tight")
+    plt.close(fig)
+    return path
+
+
+def _plot_selector_shap(shap_frame: pd.DataFrame, figure_dir: Path) -> Path:
+    top = shap_frame[["feature_name", "mean_abs_shap"]].drop_duplicates().nlargest(12, "mean_abs_shap")
+    fig, ax = plt.subplots(figsize=(10, 6))
+    sns.barplot(data=top, y="feature_name", x="mean_abs_shap", color="#2563eb", ax=ax)
+    ax.set_title("SHAP médio absoluto do seletor")
+    ax.set_xlabel("mean(|SHAP|)")
+    ax.set_ylabel("Feature")
+    path = figure_dir / FIGURE_NAMES["selector_shap"]
+    fig.tight_layout()
+    fig.savefig(path, dpi=160, bbox_inches="tight")
+    plt.close(fig)
+    return path
+
+
+def render_figures(
+    performance: pd.DataFrame,
+    umap_frame: pd.DataFrame,
+    shap_frame: pd.DataFrame,
+    figure_dir: Path,
+) -> dict[str, Path]:
+    _ensure_dir(figure_dir)
+    return {
+        "method_delta": _plot_method_delta(performance, figure_dir),
+        "method_runtime": _plot_method_runtime(performance, figure_dir),
+        "umap_best_method": _plot_umap_best_method(umap_frame, figure_dir),
+        "hdbscan_clusters": _plot_hdbscan_clusters(umap_frame, figure_dir),
+        "solver_footprints": _plot_solver_footprints(umap_frame, performance, figure_dir),
+        "selector_shap": _plot_selector_shap(shap_frame, figure_dir),
+    }
+
+
+def run_full_pipeline(root: Path, ctx: dict[str, Any], figure_dir: Path) -> dict[str, Any]:
+    feature_frame = build_paper_feature_frame(ctx)
+    performance_raw, schedules = build_method_performance_matrix(root=root, ctx=ctx)
+    performance = add_utility_and_difficulty(performance_raw)
+    best_method_df = performance.sort_values(["instance_id", "utility"]).groupby("instance_id", as_index=False).first()
+    umap_frame = build_umap_hdbscan_frame(feature_frame=feature_frame, best_method_df=best_method_df)
+    selector_report, shap_frame = build_selector_results(feature_frame=feature_frame, best_method_df=best_method_df)
+    scorecard = build_scorecard(ctx=ctx, performance=performance, selector_report=selector_report)
+
+    catalog_dir = root / "catalog"
+    aslib_dir = catalog_dir / "aslib_scenario"
+    feature_frame.to_csv(catalog_dir / "instance_features.csv", index=False)
+    performance.to_csv(catalog_dir / "method_performance_matrix.csv", index=False)
+    scorecard.to_csv(catalog_dir / "scorecard_release_sbpo.csv", index=False)
+    selector_report.to_csv(catalog_dir / "selector_report.csv", index=False)
+    shap_frame[["feature_name", "mean_abs_shap", "selected_model"]].drop_duplicates().to_csv(
+        catalog_dir / "selector_shap_summary.csv", index=False
+    )
+    umap_frame.to_csv(catalog_dir / "instance_umap_hdbscan.csv", index=False)
+    aslib_paths = export_aslib_scenario(feature_frame=feature_frame, performance=performance, out_dir=aslib_dir)
+    figure_paths = render_figures(
+        performance=performance,
+        umap_frame=umap_frame,
+        shap_frame=shap_frame,
+        figure_dir=figure_dir,
+    )
+    return {
+        "feature_frame": feature_frame,
+        "performance": performance,
+        "umap_frame": umap_frame,
+        "selector_report": selector_report,
+        "shap_frame": shap_frame,
+        "scorecard": scorecard,
+        "aslib_paths": aslib_paths,
+        "figure_paths": figure_paths,
+        "schedules": schedules,
+    }
+
 
 PIPELINE_CONFIG = {
     "generate_observed_release": False,
@@ -1521,3 +2322,159 @@ display(Markdown(summary_text))
 # - usar este notebook como baseline de validação antes de gerar filhos com G2MILP
 # - ampliar com comparações entre esta release oficial e futuros datasets derivados
 # - adicionar testes de sensibilidade por família de máquina ou por política de geração
+
+# %% [markdown]
+# # Full Paper Pipeline
+#
+# A partir daqui o notebook deixa de ser apenas uma auditoria do release e passa a
+# executar o pipeline completo pedido em `paper/Artigo.md`.
+#
+# **Nota metodológica**
+#
+# - `M0` é o baseline oficial do release observado.
+# - `M1`, `M2` e `M3` são implementados como um benchmark reproduzível de
+#   list-scheduling com políticas diferentes de ordenação e reatividade.
+# - Isso **não** substitui um replay engine end-to-end; serve como scaffold
+#   auditável para o paper enquanto o engine completo ainda não foi entregue.
+
+# %%
+ARTICLE_FIGURE_DIR = REPO_ROOT / "output" / "article_figures"
+ARTICLE_FIGURE_DIR.mkdir(parents=True, exist_ok=True)
+
+paper_results = run_full_pipeline(
+    root=ANALYSIS_ROOT,
+    ctx=NOTEBOOK_CTX,
+    figure_dir=ARTICLE_FIGURE_DIR,
+)
+
+paper_features = paper_results["feature_frame"].copy()
+method_matrix = paper_results["performance"].copy()
+umap_frame = paper_results["umap_frame"].copy()
+selector_report = paper_results["selector_report"].copy()
+selector_shap = paper_results["shap_frame"].copy()
+scorecard_release = paper_results["scorecard"].copy()
+
+display(paper_features.head())
+display(method_matrix.head())
+display(selector_report)
+
+# %% [markdown]
+# ## E1. Comparação principal entre métodos
+#
+# Este bloco entrega a tabela base do paper:
+#
+# - `M0_FIFO_OFFICIAL`
+# - `M1_WEIGHTED_SLACK`
+# - `M2_PERIODIC_15`
+# - `M2_PERIODIC_30`
+# - `M3_EVENT_REACTIVE`
+#
+# As métricas principais são `flow_mean`, `flow_p95`, `makespan`,
+# `weighted_tardiness`, `runtime_sec`, `utility` e `regret`.
+
+# %%
+method_summary = (
+    method_matrix.groupby(["method_name", "scale_code"], as_index=False)
+    .agg(
+        flow_mean=("flow_mean", "mean"),
+        flow_p95=("flow_p95", "mean"),
+        runtime_sec=("runtime_sec", "mean"),
+        utility=("utility", "mean"),
+        delta_vs_fifo_p95_flow_pct=("delta_vs_fifo_p95_flow_pct", "mean"),
+    )
+)
+display(method_summary.sort_values(["scale_code", "utility", "method_name"]))
+display(
+    method_matrix[
+        [
+            "instance_id",
+            "method_name",
+            "flow_mean",
+            "flow_p95",
+            "makespan",
+            "weighted_tardiness",
+            "runtime_sec",
+            "utility",
+            "regret",
+            "difficulty",
+        ]
+    ].head(20)
+)
+
+display(Image(filename=str(paper_results["figure_paths"]["method_delta"])))
+display(Image(filename=str(paper_results["figure_paths"]["method_runtime"])))
+
+# %% [markdown]
+# ## E3. ISA, UMAP, HDBSCAN e solver footprints
+#
+# O backend antigo já entregava `PCA`; aqui acrescentamos:
+#
+# - `UMAP` para a geometria não linear;
+# - `HDBSCAN` para clusters e outliers;
+# - `solver footprints` via `utility <= best + ε`.
+
+# %%
+display(
+    umap_frame[
+        [
+            "instance_id",
+            "scale_code",
+            "regime_code",
+            "best_method",
+            "difficulty",
+            "cluster_label",
+            "umap_x",
+            "umap_y",
+        ]
+    ].sort_values(["best_method", "instance_id"])
+)
+display(Image(filename=str(paper_results["figure_paths"]["umap_best_method"])))
+display(Image(filename=str(paper_results["figure_paths"]["hdbscan_clusters"])))
+display(Image(filename=str(paper_results["figure_paths"]["solver_footprints"])))
+
+# %% [markdown]
+# ## E4. Selector, SHAP e exportação ASlib
+#
+# Com apenas 36 instâncias, o selector continua **explicativo**, não um claim
+# forte de produção. Mesmo assim, ele fecha o protocolo:
+#
+# - compara árvore, random forest e LightGBM quando disponível;
+# - exporta `features.csv`, `performance.csv`, `runstatus.csv`,
+#   `feature_costs.csv` e `cv.csv` em `catalog/aslib_scenario/`;
+# - salva o sumário de `SHAP` em `catalog/selector_shap_summary.csv`.
+
+# %%
+display(selector_report)
+display(selector_shap[["feature_name", "mean_abs_shap", "selected_model"]].drop_duplicates().head(15))
+display(Image(filename=str(paper_results["figure_paths"]["selector_shap"])))
+
+aslib_paths_df = pd.DataFrame(
+    [{"artifact_name": name, "path": str(path)} for name, path in paper_results["aslib_paths"].items()]
+)
+display(aslib_paths_df)
+
+# %% [markdown]
+# ## Scorecard do release para o paper
+#
+# Este scorecard junta:
+#
+# - a sanidade do release observado;
+# - a diversidade entre métodos;
+# - o desempenho do selector.
+
+# %%
+display(scorecard_release)
+
+# %% [markdown]
+# ## Extended Summary
+#
+# O notebook agora cobre o escopo mínimo publicável e também os blocos extras
+# pedidos no desenho metodológico:
+#
+# - exportação de `instance_features.csv`;
+# - matriz `method_performance_matrix.csv`;
+# - `UMAP`;
+# - `HDBSCAN`;
+# - `solver footprints`;
+# - `selector` com `SHAP`;
+# - `ASlib`.
