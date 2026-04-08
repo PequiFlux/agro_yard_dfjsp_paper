@@ -6,7 +6,7 @@
 #
 # **Objetivo**
 #
-# Usar o próprio notebook como workspace interativo principal para gerar, validar e explorar o release oficial `v1.1.0-observed`, reaproveitando o backend consolidado em `tools/instance_analysis_repl.py`.
+# Usar o próprio notebook como workspace interativo principal para gerar, validar e explorar o release oficial `v1.1.0-observed`, com o pipeline do paper concentrado aqui de forma auditável.
 #
 # **O que este notebook cobre**
 #
@@ -29,7 +29,7 @@
 # - regenerar uma release observada a partir de um root fonte
 # - recomputar toda a análise, inclusive `PCA`, `kNN`, tabelas e figuras
 #
-# O módulo `tools/instance_analysis_repl.py` funciona como backend compartilhado da análise, para evitar duas implementações diferentes do mesmo pipeline analítico.
+# O notebook concentra a implementação do pipeline do paper e usa apenas os módulos já existentes do repositório para leitura, validação estrutural e smoke tests do benchmark.
 
 # %%
 # Setup: notebook runtime, paths and shared backend
