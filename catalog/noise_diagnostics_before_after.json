@@ -1,0 +1,10 @@
+{
+  "before": {
+    "r2_due_slack_vs_priority": 1.0,
+    "r2_unload_proc_vs_load_machine_moisture": 0.754
+  },
+  "after": {
+    "r2_due_slack_vs_priority": 0.4848,
+    "r2_unload_proc_vs_load_machine_moisture": 0.4995
+  }
+}

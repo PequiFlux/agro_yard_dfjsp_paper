@@ -1,0 +1,194 @@
+{
+  "parent_dataset": "/mnt/data/agro_yard_dfjsp_benchmark_go_v1",
+  "derived_dataset": "/mnt/data/agro_yard_dfjsp_benchmark_go_v1_1_observed",
+  "official_release_root": "/home/marcusvinicius/Repositorios/PequiFlux/agro_yard_dfjsp_benchmark_go",
+  "official_release_repository_url": "https://github.com/PequiFlux/agro_yard_dfjsp_benchmark_go",
+  "model_id": "pequiflux_observed_noise_v1_1",
+  "global_seed": 20260327,
+  "generated_with": "ChatGPT 5.4 PRO",
+  "validated_after_integration_on": "2026-03-27",
+  "official_dataset_role": "base_dataset_for_g2milp_instance_generation",
+  "downstream_generation_model_family": "G2MILP",
+  "child_generation_contract_ref": "docs/g2milp_generation_contract.md",
+  "description": "Structured observational noise layer over the nominal Agro Yard D-FJSP benchmark, generated with ChatGPT 5.4 PRO and revalidated locally after integration.",
+  "config": {
+    "model_id": "pequiflux_observed_noise_v1_1",
+    "global_seed": 20260327,
+    "due_model": {
+      "base_slack_by_priority_min": {
+        "REGULAR": 300,
+        "CONTRACTED": 270,
+        "URGENT": 240
+      },
+      "fixed_effect_min": {
+        "appointment_flag": {
+          "0": 6,
+          "1": -8
+        },
+        "commodity": {
+          "SOY": 10,
+          "CORN": 0,
+          "SORGHUM": 5
+        },
+        "moisture_class": {
+          "DRY": -5,
+          "NORMAL": 0,
+          "WET": 9
+        },
+        "shift_bucket": {
+          "EARLY": 8,
+          "MID": 0,
+          "LATE": -12,
+          "OVERNIGHT": -20
+        },
+        "regime_code": {
+          "balanced": 0,
+          "peak": 8,
+          "disrupted": 18
+        }
+      },
+      "instance_random_sd_min": 8.0,
+      "shift_random_sd_min": 4.0,
+      "idio_t_df": 5,
+      "idio_scale_min_by_regime": {
+        "balanced": 8.0,
+        "peak": 10.0,
+        "disrupted": 12.0
+      },
+      "min_buffer_over_nominal_lb_min": 18,
+      "max_extra_over_base_min": 120
+    },
+    "proc_model": {
+      "stage_min_proc_min": {
+        "WEIGH_IN": 4,
+        "SAMPLE_CLASSIFY": 6,
+        "UNLOAD": 10,
+        "WEIGH_OUT": 4
+      },
+      "sigma_machine": {
+        "WEIGH_IN": 0.03,
+        "SAMPLE_CLASSIFY": 0.045,
+        "UNLOAD": 0.06,
+        "WEIGH_OUT": 0.025
+      },
+      "sigma_shift": {
+        "WEIGH_IN": 0.012,
+        "SAMPLE_CLASSIFY": 0.025,
+        "UNLOAD": 0.03,
+        "WEIGH_OUT": 0.01
+      },
+      "sigma_instance": {
+        "WEIGH_IN": 0.01,
+        "SAMPLE_CLASSIFY": 0.02,
+        "UNLOAD": 0.025,
+        "WEIGH_OUT": 0.008
+      },
+      "sigma_idio": {
+        "WEIGH_IN": 0.02,
+        "SAMPLE_CLASSIFY": 0.03,
+        "UNLOAD": 0.04,
+        "WEIGH_OUT": 0.018
+      },
+      "regime_log_effect": {
+        "balanced": {
+          "WEIGH_IN": 0.0,
+          "SAMPLE_CLASSIFY": 0.0,
+          "UNLOAD": 0.0,
+          "WEIGH_OUT": 0.0
+        },
+        "peak": {
+          "WEIGH_IN": 0.01,
+          "SAMPLE_CLASSIFY": 0.018,
+          "UNLOAD": 0.022,
+          "WEIGH_OUT": 0.008
+        },
+        "disrupted": {
+          "WEIGH_IN": 0.02,
+          "SAMPLE_CLASSIFY": 0.03,
+          "UNLOAD": 0.04,
+          "WEIGH_OUT": 0.015
+        }
+      },
+      "beta_congestion": {
+        "WEIGH_IN": 0.02,
+        "SAMPLE_CLASSIFY": 0.035,
+        "UNLOAD": 0.05,
+        "WEIGH_OUT": 0.015
+      },
+      "commodity_log_effect": {
+        "WEIGH_IN": {
+          "SOY": 0.0,
+          "CORN": 0.0,
+          "SORGHUM": 0.0
+        },
+        "SAMPLE_CLASSIFY": {
+          "SOY": 0.02,
+          "CORN": 0.0,
+          "SORGHUM": 0.01
+        },
+        "UNLOAD": {
+          "SOY": 0.01,
+          "CORN": 0.0,
+          "SORGHUM": 0.015
+        },
+        "WEIGH_OUT": {
+          "SOY": 0.0,
+          "CORN": 0.0,
+          "SORGHUM": 0.0
+        }
+      },
+      "moisture_log_effect": {
+        "WEIGH_IN": {
+          "DRY": 0.0,
+          "NORMAL": 0.0,
+          "WET": 0.0
+        },
+        "SAMPLE_CLASSIFY": {
+          "DRY": -0.02,
+          "NORMAL": 0.0,
+          "WET": 0.045
+        },
+        "UNLOAD": {
+          "DRY": -0.01,
+          "NORMAL": 0.0,
+          "WET": 0.028
+        },
+        "WEIGH_OUT": {
+          "DRY": 0.0,
+          "NORMAL": 0.0,
+          "WET": 0.0
+        }
+      },
+      "pause_prob": {
+        "balanced": {
+          "WEIGH_IN": 0.03,
+          "SAMPLE_CLASSIFY": 0.05,
+          "UNLOAD": 0.08,
+          "WEIGH_OUT": 0.02
+        },
+        "peak": {
+          "WEIGH_IN": 0.05,
+          "SAMPLE_CLASSIFY": 0.08,
+          "UNLOAD": 0.13,
+          "WEIGH_OUT": 0.04
+        },
+        "disrupted": {
+          "WEIGH_IN": 0.08,
+          "SAMPLE_CLASSIFY": 0.12,
+          "UNLOAD": 0.18,
+          "WEIGH_OUT": 0.06
+        }
+      },
+      "pause_max_min": {
+        "WEIGH_IN": 2,
+        "SAMPLE_CLASSIFY": 3,
+        "UNLOAD": 5,
+        "WEIGH_OUT": 2
+      },
+      "log_mult_clip": [
+        -0.28,
+        0.42
+      ]
+    }
+  }
+}

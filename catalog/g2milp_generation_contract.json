@@ -1,0 +1,27 @@
+{
+  "official_dataset_role": "base_dataset_for_g2milp_instance_generation",
+  "parent_dataset_version": "1.1.0-observed",
+  "generator_model_family": "G2MILP",
+  "dataset_is_frozen_parent": true,
+  "required_child_lineage_fields": [
+    "parent_dataset_name",
+    "parent_dataset_version",
+    "parent_instance_id",
+    "generator_model_family",
+    "generator_model_name",
+    "generator_model_version",
+    "generation_seed",
+    "generation_timestamp",
+    "generation_notes"
+  ],
+  "minimum_child_validation_requirements": [
+    "four_operations_per_job_or_declared_structural_change",
+    "at_least_one_eligible_machine_per_operation",
+    "valid_precedence_graph",
+    "positive_and_plausible_processing_times",
+    "resource_non_overlap_in_baseline_or_equivalent_checker",
+    "event_reconciliation_with_arrival_visibility_and_downtime",
+    "explicit_lineage_to_parent_release"
+  ],
+  "documentation_ref": "docs/g2milp_generation_contract.md"
+}

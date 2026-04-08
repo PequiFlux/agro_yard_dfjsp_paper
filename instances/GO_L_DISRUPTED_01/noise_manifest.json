@@ -1,0 +1,33 @@
+{
+  "instance_id": "GO_L_DISRUPTED_01",
+  "observational_noise_model_id": "pequiflux_observed_noise_v1_1",
+  "observational_noise_seed": 569216366,
+  "due_instance_random_min": -1.12319,
+  "due_shift_random_min": {
+    "EARLY": 0.17178,
+    "MID": 4.06781,
+    "LATE": 3.83136,
+    "OVERNIGHT": -1.10879
+  },
+  "proc_stage_instance_log": {
+    "WEIGH_IN": 0.0087,
+    "SAMPLE_CLASSIFY": -0.00199,
+    "UNLOAD": 0.02344,
+    "WEIGH_OUT": 0.00174
+  },
+  "proc_machine_latent_log": {
+    "WB1": 0.0318,
+    "WB2": -0.00909,
+    "WB3": 0.02068,
+    "WB4": -0.02847,
+    "LAB1": 0.08273,
+    "LAB2": 0.04679,
+    "LAB3": -0.0103,
+    "HOP1": 0.10022,
+    "HOP2": -0.00851,
+    "HOP3": -0.00015,
+    "HOP4": 0.0583,
+    "HOP5": -0.05715,
+    "HOP6": 0.05631
+  }
+}

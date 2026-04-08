@@ -1,0 +1,2 @@
+solver_backend,time_limit_sec,small_cases_optimal,all_cases_have_solution,large_cases_nontrivial_gap,gap_non_decreasing_with_case_size
+scipy.optimize.milp (HiGHS),5.0,True,True,True,False

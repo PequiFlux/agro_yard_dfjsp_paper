@@ -1,0 +1,21 @@
+{
+  "dataset_name": "Agro Yard D-FJSP GO Benchmark",
+  "dataset_version": "1.1.0-observed",
+  "instance_id": "GO_M_PEAK_01",
+  "scale_code": "M",
+  "regime_code": "peak",
+  "replicate": 1,
+  "random_seed": 31222,
+  "time_unit": "minute",
+  "load_unit": "ton",
+  "currency": "BRL",
+  "planning_horizon_min": 1080,
+  "shift_open_min": 0,
+  "shift_close_min": 720,
+  "antt_statutory_wait_limit_min": 300,
+  "antt_wait_cost_rs_per_ton_hour": 2.41,
+  "notes": "Structured observational-noise derivative of the synthetic calibrated benchmark. Nominal values remain traceable via audit CSVs.",
+  "parent_dataset_version": "1.0.0",
+  "observational_noise_model_id": "pequiflux_observed_noise_v1_1",
+  "observational_noise_seed": 1306468884
+}

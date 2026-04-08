@@ -1,0 +1,15 @@
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+
+tmp/
+
+autoresearch-state.json
+research-results.tsv
+autoresearch-lessons.md
+autoresearch-launch.json
+autoresearch-runtime.json
+autoresearch-runtime.log
+autoresearch-hook-context.json
+*.bak
+*.prev

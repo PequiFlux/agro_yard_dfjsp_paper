@@ -1,0 +1,10 @@
+source_regime,neighbor_regime,k,share
+balanced,balanced,5,0.7166666666666667
+balanced,disrupted,5,0.0
+balanced,peak,5,0.2833333333333333
+disrupted,balanced,5,0.016666666666666666
+disrupted,disrupted,5,0.7666666666666667
+disrupted,peak,5,0.21666666666666667
+peak,balanced,5,0.3166666666666667
+peak,disrupted,5,0.16666666666666666
+peak,peak,5,0.5166666666666667

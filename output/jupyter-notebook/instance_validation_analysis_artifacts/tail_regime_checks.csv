@@ -1,0 +1,5 @@
+scale_code,flow_p99_order_ok,queue_p99_order_ok,due_margin_p05_order_ok
+L,False,False,True
+M,True,True,False
+S,True,True,False
+XS,True,True,False

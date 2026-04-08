@@ -1,0 +1,29 @@
+{
+  "instance_id": "GO_M_PEAK_03",
+  "observational_noise_model_id": "pequiflux_observed_noise_v1_1",
+  "observational_noise_seed": 3299039276,
+  "due_instance_random_min": -0.03462,
+  "due_shift_random_min": {
+    "EARLY": 8.86671,
+    "MID": -3.49274,
+    "LATE": 3.27229,
+    "OVERNIGHT": -5.59252
+  },
+  "proc_stage_instance_log": {
+    "WEIGH_IN": -0.00229,
+    "SAMPLE_CLASSIFY": 0.04496,
+    "UNLOAD": -0.0345,
+    "WEIGH_OUT": -0.00622
+  },
+  "proc_machine_latent_log": {
+    "WB1": -0.0107,
+    "WB2": -0.05258,
+    "WB3": 0.03093,
+    "LAB1": -0.02428,
+    "LAB2": 0.05905,
+    "HOP1": 0.07649,
+    "HOP2": 0.02435,
+    "HOP3": -0.05385,
+    "HOP4": -0.01016
+  }
+}

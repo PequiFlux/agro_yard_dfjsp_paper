@@ -1,0 +1,8 @@
+check_name,expected,observed,pass
+manifest_dataset_version_matches_instance_params,1.1.0-observed,1.1.0-observed,True
+manifest_parent_dataset_version_matches_instance_params,1.0.0,1.0.0,True
+manifest_noise_model_id_matches_instance_params,pequiflux_observed_noise_v1_1,pequiflux_observed_noise_v1_1,True
+noise_manifest_model_id_matches_root_manifest,pequiflux_observed_noise_v1_1,pequiflux_observed_noise_v1_1,True
+noise_manifest_repository_url_matches_root_manifest,https://github.com/PequiFlux/agro_yard_dfjsp_benchmark_go,https://github.com/PequiFlux/agro_yard_dfjsp_benchmark_go,True
+noise_manifest_release_root_matches_repo_root,/workspace,/home/marcusvinicius/Repositorios/PequiFlux/agro_yard_dfjsp_benchmark_go,False
+noise_manifest_generated_with_matches_root_manifest,ChatGPT 5.4 PRO,ChatGPT 5.4 PRO,True

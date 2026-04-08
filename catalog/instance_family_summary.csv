@@ -1,0 +1,13 @@
+scale_code,regime_code,instance_count,avg_n_jobs,avg_fifo_makespan_min,avg_fifo_mean_flow_min,avg_fifo_p95_flow_min,avg_fifo_overwait_share
+L,balanced,3,72.0,668.67,54.04,70.67,0.0
+L,disrupted,3,96.0,603.0,96.05,146.33,0.0
+L,peak,3,96.0,658.67,82.34,134.0,0.0
+M,balanced,3,48.0,677.0,54.52,66.33,0.0
+M,disrupted,3,64.0,615.0,97.68,145.0,0.0
+M,peak,3,64.0,646.33,71.02,106.33,0.0
+S,balanced,3,30.0,690.0,59.1,78.33,0.0
+S,disrupted,3,40.0,598.33,89.06,142.0,0.0
+S,peak,3,40.0,632.33,74.23,107.67,0.0
+XS,balanced,3,18.0,645.0,73.57,100.0,0.0
+XS,disrupted,3,24.0,708.33,159.75,281.33,0.06
+XS,peak,3,24.0,654.33,90.19,148.0,0.0

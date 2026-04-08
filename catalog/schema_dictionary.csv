@@ -1,0 +1,59 @@
+file_name,column_name,type,description
+params.json,(root),json object,"Instance-level metadata, horizon, units, statutory wait limit and calibration note."
+machines.csv,machine_id,string,Unique machine identifier.
+machines.csv,machine_family,string,"WEIGHBRIDGE, LAB or HOPPER."
+machines.csv,allowed_stages,string,Semicolon-separated operation stages that may use the machine.
+machines.csv,rate_tph,integer/blank,Nominal unloading rate in tons per hour for hoppers; blank otherwise.
+machines.csv,speed_factor,float,Relative speed multiplier for weighing/lab operations.
+machines.csv,setup_min,integer,Embedded fixed setup time; mainly relevant for hoppers.
+machines.csv,commodity_mask,string,ALL or semicolon-separated compatible commodities.
+machines.csv,availability_start_min,integer,Machine opening time in minutes from horizon origin.
+machines.csv,availability_end_min,integer,Machine closing time in minutes from horizon origin.
+jobs.csv,job_id,string,Truck/job identifier.
+jobs.csv,commodity,string,"SOY, CORN or SORGHUM."
+jobs.csv,load_tons,integer,Truck load in tons.
+jobs.csv,arrival_time_min,integer,Physical truck arrival time.
+jobs.csv,reveal_time_min,integer,Time when the job becomes visible to the scheduler.
+jobs.csv,priority_class,string,"REGULAR, CONTRACTED or URGENT."
+jobs.csv,priority_weight,float,Suggested soft-priority multiplier for tardiness/queue penalties.
+jobs.csv,appointment_flag,0/1,1 if the truck is known before arrival.
+jobs.csv,moisture_class,string,"DRY, NORMAL or WET synthetic class affecting inspection/unloading times."
+jobs.csv,statutory_wait_limit_min,integer,5-hour legal waiting reference (300 min).
+jobs.csv,completion_due_min,integer,Synthetic service target used as soft due date.
+jobs.csv,overwait_cost_rs_per_min,float,Per-minute penalty derived from ANTT ton-hour compensation and truck load.
+operations.csv,job_id,string,Truck/job identifier.
+operations.csv,op_seq,integer,"Operation sequence: 1=WEIGH_IN, 2=SAMPLE_CLASSIFY, 3=UNLOAD, 4=WEIGH_OUT."
+operations.csv,stage_name,string,Readable stage name.
+operations.csv,machine_family,string,Required machine family for the stage.
+operations.csv,mandatory,0/1,All stages are mandatory in v1.
+operations.csv,release_time_min,integer,Exogenous release time; only stage 1 uses arrival time directly.
+precedences.csv,job_id,string,Truck/job identifier.
+precedences.csv,pred_op_seq,integer,Predecessor operation sequence.
+precedences.csv,succ_op_seq,integer,Successor operation sequence.
+precedences.csv,min_lag_min,integer,Minimum lag between predecessor completion and successor start.
+eligible_machines.csv,job_id,string,Truck/job identifier.
+eligible_machines.csv,op_seq,integer,Operation sequence.
+eligible_machines.csv,machine_id,string,Eligible machine for the operation.
+eligible_machines.csv,proc_time_min,integer,Non-preemptive processing time if the operation is assigned to the machine.
+eligible_machines.csv,setup_included,0/1,1 because processing times already embed setup constants.
+machine_downtimes.csv,machine_id,string,Machine affected by downtime.
+machine_downtimes.csv,start_min,integer,Downtime start time.
+machine_downtimes.csv,end_min,integer,Downtime end time.
+machine_downtimes.csv,reason,string,Synthetic downtime reason.
+events.csv,event_time_min,integer,Chronological event time.
+events.csv,event_type,string,"JOB_VISIBLE, JOB_ARRIVAL, MACHINE_DOWN or MACHINE_UP."
+events.csv,entity_type,string,JOB or MACHINE.
+events.csv,entity_id,string,Related job or machine identifier.
+events.csv,payload_json,json string,Compact payload for event-driven replay.
+fifo_schedule.csv,job_id,string,Truck/job identifier.
+fifo_schedule.csv,op_seq,integer,Operation sequence.
+fifo_schedule.csv,stage_name,string,Stage name.
+fifo_schedule.csv,machine_id,string,Assigned machine in the simple FIFO/earliest-completion baseline.
+fifo_schedule.csv,start_min,integer,Scheduled start time under baseline.
+fifo_schedule.csv,end_min,integer,Scheduled finish time under baseline.
+fifo_schedule.csv,wait_before_stage_min,integer,Waiting time since previous stage completion or arrival.
+fifo_job_metrics.csv,job_id,string,Truck/job identifier.
+fifo_job_metrics.csv,completion_min,integer,Final completion time under baseline.
+fifo_job_metrics.csv,flow_time_min,integer,Completion minus arrival under baseline.
+fifo_job_metrics.csv,queue_time_min,integer,Flow time minus processing time under baseline.
+fifo_job_metrics.csv,overwait_min,integer,Positive excess over 300-minute statutory wait limit.

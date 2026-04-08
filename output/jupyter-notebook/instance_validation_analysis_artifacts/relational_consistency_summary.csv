@@ -1,0 +1,10 @@
+check_name,pass_rate,failed_instance_count
+every_operation_has_eligible_machine_ok,1.0,0
+fifo_has_one_row_per_operation_ok,1.0,0
+job_events_fk_ok,1.0,0
+job_has_3_precedences_ok,1.0,0
+job_has_4_operations_ok,1.0,0
+machine_events_fk_ok,1.0,0
+metrics_job_fk_ok,1.0,0
+schedule_machine_fk_ok,1.0,0
+schedule_operation_fk_ok,1.0,0

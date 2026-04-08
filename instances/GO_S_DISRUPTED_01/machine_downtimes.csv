@@ -1,0 +1,3 @@
+machine_id,start_min,end_min,reason
+WB1,350,407,UNPLANNED_BREAKDOWN
+HOP2,504,592,UNPLANNED_BREAKDOWN
