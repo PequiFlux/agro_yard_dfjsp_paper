@@ -1,0 +1,128 @@
+{
+  "candidate_id": "DISCRIMINATING_XS_16",
+  "parent_instance_id": "GO_XS_PEAK_03",
+  "child_type": "discriminating",
+  "scale_code": "XS",
+  "regime_code": "peak",
+  "family_rank": 2,
+  "generation_intensity": 0.28,
+  "proposal_rule": "expandir regi\u00f5es com maior spread entre m\u00e9todos",
+  "target_recommendation": "acentuar flexibilidade e regimes lim\u00edtrofes onde footprints se sobrep\u00f5em",
+  "transform_meta": {
+    "top_jobs_constrained": 9,
+    "constrained_rows": [
+      [
+        "J0002",
+        1,
+        2,
+        1
+      ],
+      [
+        "J0002",
+        4,
+        2,
+        1
+      ],
+      [
+        "J0003",
+        1,
+        2,
+        1
+      ],
+      [
+        "J0003",
+        4,
+        2,
+        1
+      ],
+      [
+        "J0004",
+        1,
+        2,
+        1
+      ],
+      [
+        "J0004",
+        4,
+        2,
+        1
+      ],
+      [
+        "J0005",
+        1,
+        2,
+        1
+      ],
+      [
+        "J0005",
+        4,
+        2,
+        1
+      ],
+      [
+        "J0006",
+        1,
+        2,
+        1
+      ],
+      [
+        "J0006",
+        4,
+        2,
+        1
+      ],
+      [
+        "J0007",
+        1,
+        2,
+        1
+      ],
+      [
+        "J0007",
+        4,
+        2,
+        1
+      ],
+      [
+        "J0008",
+        1,
+        2,
+        1
+      ],
+      [
+        "J0008",
+        4,
+        2,
+        1
+      ],
+      [
+        "J0020",
+        1,
+        2,
+        1
+      ],
+      [
+        "J0020",
+        4,
+        2,
+        1
+      ],
+      [
+        "J0021",
+        1,
+        2,
+        1
+      ],
+      [
+        "J0021",
+        4,
+        2,
+        1
+      ]
+    ],
+    "hotspot_machines": [
+      "HOP1",
+      "LAB1"
+    ]
+  }
+}

@@ -1,5 +1,5 @@
 instance_id,scale_code,regime_code,recommended_solver_track,time_limit_sec,max_jobs,status_code,status_label,success,has_solution,objective_makespan_min,dual_bound_makespan_min,mip_gap,wall_time_sec,mip_node_count,job_count,op_count,eligible_var_count,machine_pair_binary_count,downtime_binary_count,constraint_count,case_label,gap_pct,objective_vs_dual_gap_min
-GO_XS_BALANCED_01,XS,balanced,exact,5.0,8,0,optimal,True,True,378.0,378.0,0.0,1.0679449949993796,1068,8,32,50,289,0,706,XS-8 jobs,0.0,0.0
-GO_S_BALANCED_01,S,balanced,exact,5.0,12,0,optimal,True,True,327.0,327.0,0.0,2.3660994509991724,1198,12,48,101,816,0,1824,S-12 jobs,0.0,0.0
-GO_M_BALANCED_01,M,balanced,hybrid,5.0,18,1,time_limit,False,True,484.99999899999995,408.0,0.15876288486342854,5.010001709999415,538,18,72,195,2526,0,5340,M-18 jobs,15.876288486342855,76.99999899999995
-GO_L_BALANCED_01,L,balanced,metaheuristic,5.0,24,1,time_limit,False,True,589.0,340.0,0.4227504244482173,5.070144125000297,342,24,96,351,6122,0,12628,L-24 jobs,42.27504244482173,249.0
+GO_XS_BALANCED_01,XS,balanced,exact,5.0,8,0,optimal,True,True,378.0,378.0,0.0,1.097299909000867,1068,8,32,50,289,0,706,XS-8 jobs,0.0,0.0
+GO_S_BALANCED_01,S,balanced,exact,5.0,12,0,optimal,True,True,327.0,327.0,0.0,2.362779982002394,1198,12,48,101,816,0,1824,S-12 jobs,0.0,0.0
+GO_M_BALANCED_01,M,balanced,hybrid,5.0,18,1,time_limit,False,True,484.99999899999995,408.0,0.15876288486342854,5.0140406979990075,579,18,72,195,2526,0,5340,M-18 jobs,15.876288486342855,76.99999899999995
+GO_L_BALANCED_01,L,balanced,metaheuristic,5.0,24,1,time_limit,False,True,589.0,340.0,0.4227504244482173,5.071931992002646,345,24,96,351,6122,0,12628,L-24 jobs,42.27504244482173,249.0

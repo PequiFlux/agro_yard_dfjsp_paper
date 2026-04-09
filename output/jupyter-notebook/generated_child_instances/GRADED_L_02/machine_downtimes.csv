@@ -1,0 +1,2 @@
+machine_id,start_min,end_min,reason
+HOP6,325,358,CHILD_GRADED_STRESS
