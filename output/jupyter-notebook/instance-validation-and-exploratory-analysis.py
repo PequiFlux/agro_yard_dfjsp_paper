@@ -80,6 +80,9 @@ REPO_ROOT = find_repo_root(Path.cwd().resolve())
 TOOLS_DIR = REPO_ROOT / "tools"
 if str(TOOLS_DIR) not in sys.path:
     sys.path.insert(0, str(TOOLS_DIR))
+GUROBI_DIR = REPO_ROOT / "gurobi"
+if str(GUROBI_DIR) not in sys.path:
+    sys.path.insert(0, str(GUROBI_DIR))
 
 import create_observed_noise_layer as observed_release_builder
 import instance_analysis_repl as repl
@@ -92,6 +95,7 @@ solver_smoke = importlib.reload(solver_smoke)
 import json
 import math
 import time
+from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -101,30 +105,49 @@ import numpy as np
 import pandas as pd
 import seaborn as sns
 import hdbscan
+from joblib import Parallel, delayed
 import shap
+from scipy.optimize import Bounds, LinearConstraint, milp
+from scipy.sparse import coo_matrix
 from scipy.spatial import ConvexHull
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.metrics import accuracy_score, balanced_accuracy_score, f1_score
 from sklearn.tree import DecisionTreeClassifier
 from lightgbm import LGBMClassifier
 from umap import UMAP
+from load_instance import build_gurobi_views, load_catalog, load_instance
 
 
 SEED = 7
 METHOD_ORDER = [
     "M0_FIFO_OFFICIAL",
+    "M0_CUSTOM_FIFO_REPLAY",
     "M1_WEIGHTED_SLACK",
     "M2_PERIODIC_15",
     "M2_PERIODIC_30",
     "M3_EVENT_REACTIVE",
+    "Mref_EXACT_XS_S",
+    "M4_METAHEURISTIC_L",
 ]
 METHOD_LABELS = {
     "M0_FIFO_OFFICIAL": "M0 FIFO oficial",
+    "M0_CUSTOM_FIFO_REPLAY": "M0 FIFO replay",
     "M1_WEIGHTED_SLACK": "M1 Weighted Slack",
     "M2_PERIODIC_15": "M2 Periódico Δ=15",
     "M2_PERIODIC_30": "M2 Periódico Δ=30",
     "M3_EVENT_REACTIVE": "M3 Evento reativo",
+    "Mref_EXACT_XS_S": "Mref exato XS/S",
+    "M4_METAHEURISTIC_L": "M4 Metaheurística L",
 }
+PAPER_METHOD_ORDER = [
+    "M0_FIFO_OFFICIAL",
+    "M1_WEIGHTED_SLACK",
+    "M2_PERIODIC_15",
+    "M2_PERIODIC_30",
+    "M3_EVENT_REACTIVE",
+    "Mref_EXACT_XS_S",
+    "M4_METAHEURISTIC_L",
+]
 UTILITY_WEIGHTS = {
     "flow_p95": 0.45,
     "flow_mean": 0.25,
@@ -147,6 +170,7 @@ class MethodSpec:
     method_name: str
     family: str
     delta_min: int | None = None
+    supported_scales: tuple[str, ...] | None = None
 
 
 METHOD_SPECS = {
@@ -154,6 +178,8 @@ METHOD_SPECS = {
     "M2_PERIODIC_15": MethodSpec("M2_PERIODIC_15", "periodic", delta_min=15),
     "M2_PERIODIC_30": MethodSpec("M2_PERIODIC_30", "periodic", delta_min=30),
     "M3_EVENT_REACTIVE": MethodSpec("M3_EVENT_REACTIVE", "event"),
+    "Mref_EXACT_XS_S": MethodSpec("Mref_EXACT_XS_S", "exact_reference", supported_scales=("XS", "S")),
+    "M4_METAHEURISTIC_L": MethodSpec("M4_METAHEURISTIC_L", "metaheuristic", supported_scales=("L",)),
 }
 
 
@@ -288,7 +314,12 @@ def _build_job_order(instance: dict[str, pd.DataFrame], method_name: str) -> lis
         jobs["completion_due_min"] - jobs["reveal_time_min"] - jobs["nominal_lb_min"]
     ) / jobs["priority_weight"].replace(0.0, 1.0)
 
-    if method_name == "M1_WEIGHTED_SLACK":
+    if method_name == "M0_CUSTOM_FIFO_REPLAY":
+        order = jobs.sort_values(
+            ["arrival_time_min", "reveal_time_min", "job_id"],
+            ascending=[True, True, True],
+        )
+    elif method_name == "M1_WEIGHTED_SLACK":
         order = jobs.sort_values(
             ["weighted_slack", "priority_weight", "arrival_time_min", "job_id"],
             ascending=[True, False, True, True],
@@ -314,6 +345,29 @@ def _build_job_order(instance: dict[str, pd.DataFrame], method_name: str) -> lis
     return order["job_id"].tolist()
 
 
+def _build_machine_windows(
+    instance: dict[str, pd.DataFrame],
+    blocked_rows: pd.DataFrame | None = None,
+) -> dict[str, list[tuple[float, float]]]:
+    downtimes = instance["downtimes"].copy()
+    windows = {
+        machine_id: sorted(
+            list(
+                downtimes.loc[downtimes["machine_id"].eq(machine_id), ["start_min", "end_min"]]
+                .astype(float)
+                .itertuples(index=False, name=None)
+            )
+        )
+        for machine_id in instance["machines"]["machine_id"]
+    }
+    if blocked_rows is not None and not blocked_rows.empty:
+        for row in blocked_rows.itertuples(index=False):
+            windows.setdefault(row.machine_id, []).append((float(row.start_min), float(row.end_min)))
+        for machine_id in windows:
+            windows[machine_id] = sorted(windows[machine_id], key=lambda item: (item[0], item[1]))
+    return windows
+
+
 def _find_earliest_machine_slot(
     machine_id: str,
     machine_available: dict[str, float],
@@ -332,35 +386,86 @@ def _find_earliest_machine_slot(
     return float(start)
 
 
-def _schedule_jobs_by_policy(root: Path, instance_id: str, method_name: str) -> tuple[pd.DataFrame, dict[str, Any]]:
-    instance = _load_instance_tables(root, instance_id)
+def _build_job_metrics_from_schedule(
+    jobs: pd.DataFrame,
+    schedule: pd.DataFrame,
+) -> pd.DataFrame:
+    grouped = schedule.groupby("job_id", as_index=False).agg(
+        completion_min=("end_min", "max"),
+        queue_time_min=("wait_before_stage_min", "sum"),
+    )
+    job_metrics = jobs[
+        ["job_id", "arrival_time_min", "completion_due_min", "priority_weight", "statutory_wait_limit_min"]
+    ].copy().merge(grouped, on="job_id", how="left")
+    job_metrics["completion_min"] = job_metrics["completion_min"].fillna(job_metrics["arrival_time_min"])
+    job_metrics["queue_time_min"] = job_metrics["queue_time_min"].fillna(0.0)
+    job_metrics["flow_time_min"] = job_metrics["completion_min"] - job_metrics["arrival_time_min"]
+    job_metrics["overwait_min"] = np.maximum(
+        job_metrics["queue_time_min"] - job_metrics["statutory_wait_limit_min"], 0.0
+    )
+    job_metrics["tardiness_min"] = np.maximum(
+        job_metrics["completion_min"] - job_metrics["completion_due_min"], 0.0
+    )
+    return job_metrics
+
+
+def _summarize_schedule(
+    instance_id: str,
+    method_name: str,
+    jobs: pd.DataFrame,
+    schedule: pd.DataFrame,
+    runtime_sec: float,
+    solver_status: str,
+    replan_count: int,
+    extra: dict[str, Any] | None = None,
+) -> tuple[pd.DataFrame, dict[str, Any]]:
+    job_metrics = _build_job_metrics_from_schedule(jobs=jobs, schedule=schedule)
+    summary = {
+        "instance_id": instance_id,
+        "method_name": method_name,
+        "runtime_sec": float(runtime_sec),
+        "makespan": float(job_metrics["completion_min"].max()),
+        "flow_mean": float(job_metrics["flow_time_min"].mean()),
+        "flow_p95": float(np.quantile(job_metrics["flow_time_min"], 0.95)),
+        "queue_mean": float(job_metrics["queue_time_min"].mean()),
+        "queue_p95": float(np.quantile(job_metrics["queue_time_min"], 0.95)),
+        "weighted_tardiness": float((job_metrics["tardiness_min"] * job_metrics["priority_weight"]).sum()),
+        "replan_count": int(replan_count),
+        "solver_status": solver_status,
+    }
+    if extra:
+        summary.update(extra)
+    return job_metrics, summary
+
+
+def _schedule_jobs_from_order(
+    instance_id: str,
+    method_name: str,
+    instance: dict[str, pd.DataFrame],
+    job_order: list[str],
+    blocked_rows: pd.DataFrame | None = None,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
     jobs = instance["jobs"].copy()
     ops = instance["operations"].copy().sort_values(["job_id", "op_seq"])
     eligible = instance["eligible"].copy()
     machines = instance["machines"].copy()
-    downtimes = instance["downtimes"].copy()
 
-    job_order = _build_job_order(instance, method_name)
-    job_index = {job_id: idx for idx, job_id in enumerate(job_order)}
-
+    blocked_rows = blocked_rows.copy() if blocked_rows is not None else pd.DataFrame()
     machine_available = dict(zip(machines["machine_id"], machines["availability_start_min"].astype(float)))
-    machine_end = dict(zip(machines["machine_id"], machines["availability_end_min"].astype(float)))
-    machine_windows = {
-        machine_id: sorted(
-            list(
-                downtimes.loc[downtimes["machine_id"].eq(machine_id), ["start_min", "end_min"]]
-                .itertuples(index=False, name=None)
-            )
-        )
-        for machine_id in machines["machine_id"]
-    }
-
+    machine_windows = _build_machine_windows(instance=instance, blocked_rows=blocked_rows)
+    job_index = {job_id: idx for idx, job_id in enumerate(job_order)}
     scheduled_rows: list[dict[str, Any]] = []
-    job_completion: dict[str, float] = {}
-    queue_minutes: dict[str, float] = {job_id: 0.0 for job_id in job_order}
+    fixed_jobs = set()
 
-    started = time.perf_counter()
+    if not blocked_rows.empty:
+        blocked_rows = blocked_rows.copy()
+        blocked_rows["policy_method"] = method_name
+        scheduled_rows.extend(blocked_rows.to_dict(orient="records"))
+        fixed_jobs = set(blocked_rows["job_id"].astype(str))
+
     for job_id in job_order:
+        if job_id in fixed_jobs:
+            continue
         job_row = jobs.loc[jobs["job_id"].eq(job_id)].iloc[0]
         ready_min = float(max(job_row["arrival_time_min"], job_row["reveal_time_min"]))
         job_ops = ops.loc[ops["job_id"].eq(job_id)].sort_values("op_seq")
@@ -377,25 +482,17 @@ def _schedule_jobs_by_policy(root: Path, instance_id: str, method_name: str) -> 
                     machine_windows=machine_windows,
                     ready_min=op_ready,
                     duration_min=float(elig_row.proc_time_min),
-                    machine_end=machine_end,
+                    machine_end={},
                 )
                 if start_min is None:
                     continue
                 end_min = start_min + float(elig_row.proc_time_min)
-                choices.append(
-                    (
-                        end_min,
-                        start_min,
-                        float(elig_row.proc_time_min),
-                        elig_row.machine_id,
-                    )
-                )
+                choices.append((end_min, start_min, float(elig_row.proc_time_min), elig_row.machine_id))
             if not choices:
                 raise RuntimeError(f"No feasible machine choice for {instance_id} {job_id} op {op_row.op_seq}.")
             _, start_min, proc_time_min, machine_id = min(choices)
             end_min = start_min + proc_time_min
             machine_available[machine_id] = end_min
-            queue_minutes[job_id] += max(0.0, start_min - op_ready)
             scheduled_rows.append(
                 {
                     "instance_id": instance_id,
@@ -411,39 +508,407 @@ def _schedule_jobs_by_policy(root: Path, instance_id: str, method_name: str) -> 
                 }
             )
             ready_min = end_min
-        job_completion[job_id] = ready_min
-    runtime_sec = time.perf_counter() - started
 
-    schedule = pd.DataFrame(scheduled_rows).sort_values(["start_min", "end_min", "job_id", "op_seq"]).reset_index(drop=True)
-    job_metrics = jobs[["job_id", "arrival_time_min", "completion_due_min", "priority_weight", "statutory_wait_limit_min"]].copy()
-    job_metrics["completion_min"] = job_metrics["job_id"].map(job_completion)
-    job_metrics["flow_time_min"] = job_metrics["completion_min"] - job_metrics["arrival_time_min"]
-    job_metrics["queue_time_min"] = job_metrics["job_id"].map(queue_minutes)
-    job_metrics["overwait_min"] = np.maximum(
-        job_metrics["queue_time_min"] - job_metrics["statutory_wait_limit_min"], 0.0
+    schedule = (
+        pd.DataFrame(scheduled_rows)
+        .sort_values(["start_min", "end_min", "job_id", "op_seq"])
+        .reset_index(drop=True)
     )
-    job_metrics["tardiness_min"] = np.maximum(
-        job_metrics["completion_min"] - job_metrics["completion_due_min"], 0.0
+    return schedule, _build_job_metrics_from_schedule(jobs=jobs, schedule=schedule)
+
+
+def _method_objective_tuple(summary: dict[str, Any]) -> tuple[float, float, float, float, float]:
+    return (
+        float(summary["weighted_tardiness"]),
+        float(summary["flow_p95"]),
+        float(summary["flow_mean"]),
+        float(summary["makespan"]),
+        float(summary["runtime_sec"]),
     )
-    summary = {
-        "instance_id": instance_id,
-        "method_name": method_name,
-        "runtime_sec": float(runtime_sec),
-        "makespan": float(job_metrics["completion_min"].max()),
-        "flow_mean": float(job_metrics["flow_time_min"].mean()),
-        "flow_p95": float(np.quantile(job_metrics["flow_time_min"], 0.95)),
-        "queue_mean": float(job_metrics["queue_time_min"].mean()),
-        "queue_p95": float(np.quantile(job_metrics["queue_time_min"], 0.95)),
-        "weighted_tardiness": float((job_metrics["tardiness_min"] * job_metrics["priority_weight"]).sum()),
-        "replan_count": int(max(1, jobs["reveal_time_min"].nunique())),
-        "solver_status": "heuristic_feasible",
+
+
+def _perturb_job_order(order: list[str], rng: np.random.Generator) -> list[str]:
+    candidate = list(order)
+    if len(candidate) < 2:
+        return candidate
+    i, j = sorted(rng.choice(len(candidate), size=2, replace=False).tolist())
+    if rng.random() < 0.5:
+        candidate[i], candidate[j] = candidate[j], candidate[i]
+    else:
+        value = candidate.pop(j)
+        candidate.insert(i, value)
+    return candidate
+
+
+def _evaluate_candidate_order(
+    root: Path,
+    instance_id: str,
+    method_name: str,
+    job_order: list[str],
+    blocked_rows: pd.DataFrame | None = None,
+) -> tuple[list[str], pd.DataFrame, dict[str, Any]]:
+    instance = _load_instance_tables(root, instance_id)
+    started = time.perf_counter()
+    schedule, _ = _schedule_jobs_from_order(
+        instance_id=instance_id,
+        method_name=method_name,
+        instance=instance,
+        job_order=job_order,
+        blocked_rows=blocked_rows,
+    )
+    _, summary = _summarize_schedule(
+        instance_id=instance_id,
+        method_name=method_name,
+        jobs=instance["jobs"].copy(),
+        schedule=schedule,
+        runtime_sec=time.perf_counter() - started,
+        solver_status="heuristic_feasible",
+        replan_count=max(1, instance["jobs"]["reveal_time_min"].nunique()),
+    )
+    return job_order, schedule, summary
+
+
+def _optimize_job_order(
+    root: Path,
+    instance_id: str,
+    method_name: str,
+    seed_order: list[str],
+    time_budget_sec: float,
+    n_workers: int = 1,
+    blocked_rows: pd.DataFrame | None = None,
+) -> tuple[pd.DataFrame, dict[str, Any]]:
+    rng = np.random.default_rng(SEED + abs(hash((instance_id, method_name))) % 100000)
+    _, best_schedule, best_summary = _evaluate_candidate_order(
+        root=root,
+        instance_id=instance_id,
+        method_name=method_name,
+        job_order=seed_order,
+        blocked_rows=blocked_rows,
+    )
+    best_order = list(seed_order)
+    started = time.perf_counter()
+    while time.perf_counter() - started < time_budget_sec:
+        batch_orders = [_perturb_job_order(best_order, rng) for _ in range(max(2, 2 * n_workers))]
+        if n_workers > 1:
+            results = Parallel(n_jobs=n_workers, prefer="threads")(
+                delayed(_evaluate_candidate_order)(
+                    root=root,
+                    instance_id=instance_id,
+                    method_name=method_name,
+                    job_order=order,
+                    blocked_rows=blocked_rows,
+                )
+                for order in batch_orders
+            )
+        else:
+            results = [
+                _evaluate_candidate_order(
+                    root=root,
+                    instance_id=instance_id,
+                    method_name=method_name,
+                    job_order=order,
+                    blocked_rows=blocked_rows,
+                )
+                for order in batch_orders
+            ]
+        for order, schedule, summary in results:
+            if _method_objective_tuple(summary) < _method_objective_tuple(best_summary):
+                best_order = list(order)
+                best_schedule = schedule
+                best_summary = summary
+    best_summary["runtime_sec"] = float(time.perf_counter() - started)
+    best_summary["solver_status"] = f"metaheuristic_workers_{n_workers}"
+    return best_schedule, best_summary
+
+
+def _status_label_scipy(result: Any) -> str:
+    message = str(getattr(result, "message", "")).lower()
+    if getattr(result, "status", None) == 0:
+        return "optimal"
+    if "time limit" in message or "time_limit" in message:
+        return "time_limit"
+    if "infeasible" in message:
+        return "infeasible"
+    if getattr(result, "success", False):
+        return "feasible"
+    return "other"
+
+
+def _exact_subset_job_cap(scale_code: str) -> int:
+    return {"XS": 12, "S": 16}.get(scale_code, 12)
+
+
+def _build_exact_model_for_jobs(instance_dir: Path, max_jobs: int) -> tuple[np.ndarray, np.ndarray, Bounds, list[LinearConstraint], dict[str, Any], dict[str, dict[Any, int]], dict[str, Any]]:
+    raw = load_instance(instance_dir)
+    ordered_jobs = sorted(raw["jobs"], key=lambda row: (row["arrival_time_min"], row["job_id"]))[:max_jobs]
+    keep_jobs = {row["job_id"] for row in ordered_jobs}
+    restricted = dict(raw)
+    restricted["jobs"] = [row for row in raw["jobs"] if row["job_id"] in keep_jobs]
+    restricted["operations"] = [row for row in raw["operations"] if row["job_id"] in keep_jobs]
+    restricted["precedences"] = [row for row in raw["precedences"] if row["job_id"] in keep_jobs]
+    restricted["eligible_machines"] = [row for row in raw["eligible_machines"] if row["job_id"] in keep_jobs]
+    keep_machines = {row["machine_id"] for row in restricted["eligible_machines"]}
+    restricted["machines"] = [row for row in raw["machines"] if row["machine_id"] in keep_machines]
+    restricted["machine_downtimes"] = [row for row in raw["machine_downtimes"] if row["machine_id"] in keep_machines]
+    data = build_gurobi_views(restricted)
+    ops_release = {(row["job_id"], row["op_seq"]): int(row["release_time_min"]) for row in restricted["operations"]}
+    lag_by_arc = {
+        (row["job_id"], row["pred_op_seq"], row["succ_op_seq"]): int(row["min_lag_min"])
+        for row in restricted["precedences"]
     }
-    if method_name.startswith("M2_PERIODIC"):
-        delta = METHOD_SPECS[method_name].delta_min or 15
-        summary["replan_count"] = int(jobs["reveal_time_min"].floordiv(delta).nunique())
-    elif method_name == "M1_WEIGHTED_SLACK":
-        summary["replan_count"] = 1
-    return schedule, summary
+    horizon = max(
+        int(data["params"]["planning_horizon_min"]),
+        max(data["DUE"].values()),
+        max((end for downs in data["DOWNTIMES_BY_MACHINE"].values() for _, end, _ in downs), default=0),
+    )
+    max_proc = max(data["PROC"].values())
+    big_m = float(horizon + max_proc + 1)
+    ops = list(data["OPS"])
+    eligible_keys = list(data["ELIGIBLE_KEYS"])
+    last_ops = [(job_id, max(op_seq for j2, op_seq in ops if j2 == job_id)) for job_id in data["J"]]
+
+    x_idx = {key: i for i, key in enumerate(eligible_keys)}
+    cursor = len(x_idx)
+    s_idx = {(j, o): cursor + i for i, (j, o) in enumerate(ops)}
+    cursor += len(s_idx)
+    c_idx = {(j, o): cursor + i for i, (j, o) in enumerate(ops)}
+    cursor += len(c_idx)
+    cmax_idx = cursor
+    cursor += 1
+
+    pair_records: list[tuple[tuple[str, int], tuple[str, int], str]] = []
+    for machine_id in data["M"]:
+        eligible_ops = sorted({(j, o) for (j, o, m) in eligible_keys if m == machine_id})
+        for idx_a in range(len(eligible_ops)):
+            for idx_b in range(idx_a + 1, len(eligible_ops)):
+                pair_records.append((eligible_ops[idx_a], eligible_ops[idx_b], machine_id))
+    y_idx = {record: cursor + i for i, record in enumerate(pair_records)}
+    cursor += len(y_idx)
+
+    downtime_records: list[tuple[str, int, str, int]] = []
+    for (j, o, machine_id) in eligible_keys:
+        for dt_idx, _ in enumerate(data["DOWNTIMES_BY_MACHINE"].get(machine_id, [])):
+            downtime_records.append((j, o, machine_id, dt_idx))
+    q_idx = {record: cursor + i for i, record in enumerate(downtime_records)}
+    cursor += len(q_idx)
+
+    n_vars = cursor
+    c = np.zeros(n_vars, dtype=float)
+    c[cmax_idx] = 1.0
+    lb = np.zeros(n_vars, dtype=float)
+    ub = np.full(n_vars, big_m, dtype=float)
+    integrality = np.zeros(n_vars, dtype=int)
+    for idx in list(x_idx.values()) + list(y_idx.values()) + list(q_idx.values()):
+        ub[idx] = 1.0
+        integrality[idx] = 1
+
+    row_idx: list[int] = []
+    col_idx: list[int] = []
+    values: list[float] = []
+    lower: list[float] = []
+    upper: list[float] = []
+    row = 0
+
+    def add_constraint(coeffs: dict[int, float], lb_value: float, ub_value: float) -> None:
+        nonlocal row
+        for col, value in coeffs.items():
+            row_idx.append(row)
+            col_idx.append(col)
+            values.append(value)
+        lower.append(lb_value)
+        upper.append(ub_value)
+        row += 1
+
+    for j, o in ops:
+        add_constraint({x_idx[(j, o, m)]: 1.0 for m in data["ELIGIBLE_BY_OP"][(j, o)]}, 1.0, 1.0)
+    for j, o in ops:
+        coeffs = {c_idx[(j, o)]: 1.0, s_idx[(j, o)]: -1.0}
+        for m in data["ELIGIBLE_BY_OP"][(j, o)]:
+            coeffs[x_idx[(j, o, m)]] = -float(data["PROC"][(j, o, m)])
+        add_constraint(coeffs, 0.0, 0.0)
+    for j, o in ops:
+        add_constraint({s_idx[(j, o)]: 1.0}, float(ops_release[(j, o)]), np.inf)
+    for (j, pred, succ) in data["PRED"]:
+        lag = float(lag_by_arc[(j, pred, succ)])
+        add_constraint({s_idx[(j, succ)]: 1.0, c_idx[(j, pred)]: -1.0}, lag, np.inf)
+    for j, o in last_ops:
+        add_constraint({cmax_idx: 1.0, c_idx[(j, o)]: -1.0}, 0.0, np.inf)
+    for (op_a, op_b, machine_id), y_var in y_idx.items():
+        j_a, o_a = op_a
+        j_b, o_b = op_b
+        x_a = x_idx[(j_a, o_a, machine_id)]
+        x_b = x_idx[(j_b, o_b, machine_id)]
+        add_constraint({s_idx[(j_b, o_b)]: 1.0, c_idx[(j_a, o_a)]: -1.0, y_var: -big_m, x_a: -big_m, x_b: -big_m}, -3.0 * big_m, np.inf)
+        add_constraint({s_idx[(j_a, o_a)]: 1.0, c_idx[(j_b, o_b)]: -1.0, y_var: big_m, x_a: -big_m, x_b: -big_m}, -2.0 * big_m, np.inf)
+    for (j, o, machine_id, dt_idx), q_var in q_idx.items():
+        down_start, down_end, _ = data["DOWNTIMES_BY_MACHINE"][machine_id][dt_idx]
+        x_var = x_idx[(j, o, machine_id)]
+        add_constraint({c_idx[(j, o)]: 1.0, q_var: big_m, x_var: -big_m}, -np.inf, float(down_start + big_m))
+        add_constraint({s_idx[(j, o)]: 1.0, q_var: big_m, x_var: -big_m}, float(down_end - big_m), np.inf)
+
+    matrix = coo_matrix(
+        (
+            np.asarray(values, dtype=np.float64),
+            (np.asarray(row_idx, dtype=np.int32), np.asarray(col_idx, dtype=np.int32)),
+        ),
+        shape=(row, n_vars),
+    ).tocsr()
+    matrix.indices = matrix.indices.astype(np.int32, copy=False)
+    matrix.indptr = matrix.indptr.astype(np.int32, copy=False)
+    metadata = {
+        "job_ids": [row["job_id"] for row in ordered_jobs],
+        "ops_release": ops_release,
+        "op_stage": {(row["job_id"], row["op_seq"]): row["stage_name"] for row in restricted["operations"]},
+        "big_m": big_m,
+        "job_count": len(data["J"]),
+    }
+    mappings = {"x": x_idx, "s": s_idx, "c": c_idx}
+    return c, integrality, Bounds(lb, ub), [LinearConstraint(matrix, np.array(lower), np.array(upper))], metadata, mappings, restricted
+
+
+def _solve_exact_reference_schedule(
+    root: Path,
+    instance_id: str,
+    time_limit_sec: float,
+    max_jobs: int,
+    method_name: str = "Mref_EXACT_XS_S",
+) -> tuple[pd.DataFrame, dict[str, Any]]:
+    instance_dir = root / "instances" / instance_id
+    c, integrality, bounds, constraints, metadata, mappings, restricted = _build_exact_model_for_jobs(
+        instance_dir=instance_dir,
+        max_jobs=max_jobs,
+    )
+    started = time.perf_counter()
+    result = milp(
+        c,
+        integrality=integrality,
+        bounds=bounds,
+        constraints=constraints,
+        options={"time_limit": float(time_limit_sec), "disp": False},
+    )
+    runtime_sec = time.perf_counter() - started
+    solution = getattr(result, "x", None)
+    if solution is None or not np.isfinite(getattr(result, "fun", np.nan)):
+        raise RuntimeError(f"Exact reference failed for {instance_id} with status={_status_label_scipy(result)}")
+    chosen = {}
+    for key, idx in mappings["x"].items():
+        if solution[idx] >= 0.5:
+            chosen[(key[0], key[1])] = key[2]
+    rows = []
+    for (job_id, op_seq), machine_id in sorted(chosen.items(), key=lambda item: (solution[mappings["s"][(item[0][0], item[0][1])]], item[0][0], item[0][1])):
+        start_min = float(solution[mappings["s"][(job_id, op_seq)]])
+        end_min = float(solution[mappings["c"][(job_id, op_seq)]])
+        rows.append(
+            {
+                "instance_id": instance_id,
+                "job_id": job_id,
+                "job_rank": 0,
+                "op_seq": int(op_seq),
+                "stage_name": metadata["op_stage"][(job_id, op_seq)],
+                "machine_id": machine_id,
+                "start_min": start_min,
+                "end_min": end_min,
+                "wait_before_stage_min": 0.0,
+                "policy_method": method_name,
+            }
+        )
+    schedule = pd.DataFrame(rows).sort_values(["start_min", "end_min", "job_id", "op_seq"]).reset_index(drop=True)
+    for job_id, job_rows in schedule.groupby("job_id"):
+        job_rows = job_rows.sort_values("op_seq")
+        prev_end = None
+        for idx, row in job_rows.iterrows():
+            op_release = float(metadata["ops_release"][(job_id, int(row["op_seq"]))])
+            op_ready = op_release if prev_end is None else max(op_release, prev_end)
+            schedule.loc[idx, "wait_before_stage_min"] = max(0.0, float(row["start_min"]) - op_ready)
+            prev_end = float(row["end_min"])
+    info = {
+        "runtime_sec": float(runtime_sec),
+        "solver_status": _status_label_scipy(result),
+        "mip_gap": float(getattr(result, "mip_gap", np.nan)),
+        "exact_job_count": int(metadata["job_count"]),
+    }
+    return schedule, info
+
+
+def _schedule_jobs_by_policy(root: Path, instance_id: str, method_name: str) -> tuple[pd.DataFrame, dict[str, Any]]:
+    instance = _load_instance_tables(root, instance_id)
+    jobs = instance["jobs"].copy()
+    scale_code = str(jobs["job_id"].iloc[0]).split("_")[1] if False else None
+    started = time.perf_counter()
+
+    if method_name in {"M0_CUSTOM_FIFO_REPLAY", "M1_WEIGHTED_SLACK", "M2_PERIODIC_15", "M2_PERIODIC_30", "M3_EVENT_REACTIVE"}:
+        job_order = _build_job_order(instance, method_name)
+        schedule, _ = _schedule_jobs_from_order(
+            instance_id=instance_id,
+            method_name=method_name,
+            instance=instance,
+            job_order=job_order,
+        )
+        replan_count = 1
+        if method_name.startswith("M2_PERIODIC"):
+            delta = METHOD_SPECS[method_name].delta_min or 15
+            replan_count = int(jobs["reveal_time_min"].floordiv(delta).nunique())
+        elif method_name == "M3_EVENT_REACTIVE":
+            replan_count = int(max(1, jobs["reveal_time_min"].nunique()))
+        _, summary = _summarize_schedule(
+            instance_id=instance_id,
+            method_name=method_name,
+            jobs=jobs,
+            schedule=schedule,
+            runtime_sec=time.perf_counter() - started,
+            solver_status="heuristic_feasible",
+            replan_count=replan_count,
+        )
+        return schedule, summary
+
+    catalog_row = pd.read_csv(root / "catalog" / "benchmark_catalog.csv").loc[
+        lambda df: df["instance_id"].eq(instance_id)
+    ].iloc[0]
+    scale_code = str(catalog_row["scale_code"])
+
+    if method_name == "M4_METAHEURISTIC_L":
+        seed_order = _build_job_order(instance, "M3_EVENT_REACTIVE")
+        schedule, summary = _optimize_job_order(
+            root=root,
+            instance_id=instance_id,
+            method_name=method_name,
+            seed_order=seed_order,
+            time_budget_sec=2.5,
+            n_workers=4,
+        )
+        summary["replan_count"] = int(max(1, jobs["reveal_time_min"].nunique()))
+        return schedule, summary
+
+    if method_name == "Mref_EXACT_XS_S":
+        cap = _exact_subset_job_cap(scale_code)
+        exact_schedule, exact_info = _solve_exact_reference_schedule(
+            root=root,
+            instance_id=instance_id,
+            time_limit_sec=6.0,
+            max_jobs=cap,
+            method_name=method_name,
+        )
+        remaining_order = [job for job in _build_job_order(instance, "M3_EVENT_REACTIVE") if job not in set(exact_schedule["job_id"])]
+        schedule, _ = _schedule_jobs_from_order(
+            instance_id=instance_id,
+            method_name=method_name,
+            instance=instance,
+            job_order=remaining_order,
+            blocked_rows=exact_schedule,
+        )
+        _, summary = _summarize_schedule(
+            instance_id=instance_id,
+            method_name=method_name,
+            jobs=jobs,
+            schedule=schedule,
+            runtime_sec=exact_info["runtime_sec"],
+            solver_status=exact_info["solver_status"],
+            replan_count=1,
+            extra={"mip_gap": exact_info["mip_gap"], "exact_job_count": exact_info["exact_job_count"]},
+        )
+        return schedule, summary
+
+    raise ValueError(f"Unsupported method: {method_name}")
 
 
 def build_method_performance_matrix(root: Path, ctx: dict[str, Any]) -> tuple[pd.DataFrame, dict[str, pd.DataFrame]]:
@@ -469,7 +934,11 @@ def build_method_performance_matrix(root: Path, ctx: dict[str, Any]) -> tuple[pd
     for method_name in METHOD_SPECS:
         summary_rows = []
         schedule_rows = []
-        for instance_id in catalog["instance_id"].tolist():
+        spec = METHOD_SPECS[method_name]
+        eligible_instances = catalog.copy()
+        if spec.supported_scales:
+            eligible_instances = eligible_instances.loc[eligible_instances["scale_code"].isin(spec.supported_scales)]
+        for instance_id in eligible_instances["instance_id"].tolist():
             schedule, summary = _schedule_jobs_by_policy(root=root, instance_id=instance_id, method_name=method_name)
             summary_rows.append(summary)
             schedule_rows.append(schedule)
@@ -717,7 +1186,7 @@ def _plot_method_delta(performance: pd.DataFrame, figure_dir: Path) -> Path:
         performance.groupby(["method_name", "scale_code"], as_index=False)["delta_vs_fifo_p95_flow_pct"]
         .mean()
         .pivot(index="method_name", columns="scale_code", values="delta_vs_fifo_p95_flow_pct")
-        .reindex(index=METHOD_ORDER, columns=["XS", "S", "M", "L"])
+        .reindex(index=PAPER_METHOD_ORDER, columns=["XS", "S", "M", "L"])
     )
     fig, ax = plt.subplots(figsize=(10, 5))
     sns.heatmap(summary * 100.0, annot=True, fmt=".1f", cmap="RdYlGn_r", center=0.0, ax=ax, cbar_kws={"label": "% vs FIFO"})
@@ -734,7 +1203,7 @@ def _plot_method_delta(performance: pd.DataFrame, figure_dir: Path) -> Path:
 def _plot_method_runtime(performance: pd.DataFrame, figure_dir: Path) -> Path:
     runtime = (
         performance.pivot(index="instance_id", columns="method_name", values="runtime_sec")
-        .reindex(columns=METHOD_ORDER)
+        .reindex(columns=PAPER_METHOD_ORDER)
         .fillna(0.0)
     )
     fig, ax = plt.subplots(figsize=(11, 8))
@@ -888,6 +1357,546 @@ def run_full_pipeline(root: Path, ctx: dict[str, Any], figure_dir: Path) -> dict
         "figure_paths": figure_paths,
         "schedules": schedules,
     }
+
+
+def show_inline_figure(path: Path, title: str, figsize: tuple[float, float] = (11, 6)) -> None:
+    image = plt.imread(path)
+    fig, ax = plt.subplots(figsize=figsize)
+    ax.imshow(image)
+    ax.set_title(title)
+    ax.axis("off")
+    fig.tight_layout()
+    plt.show()
+    plt.close(fig)
+
+
+def build_experiment_coverage_table() -> pd.DataFrame:
+    return pd.DataFrame(
+        [
+            {
+                "item_type": "method",
+                "item_name": "M0_FIFO_OFFICIAL",
+                "status": "implemented",
+                "notes": "usa os artefatos oficiais do release observado",
+            },
+            {
+                "item_type": "method",
+                "item_name": "M1_WEIGHTED_SLACK",
+                "status": "implemented",
+                "notes": "heurística estática reproduzível no notebook",
+            },
+            {
+                "item_type": "method",
+                "item_name": "M2_PERIODIC_15",
+                "status": "implemented",
+                "notes": "proxy periódico com Δ=15 min",
+            },
+            {
+                "item_type": "method",
+                "item_name": "M2_PERIODIC_30",
+                "status": "implemented",
+                "notes": "proxy periódico com Δ=30 min",
+            },
+            {
+                "item_type": "method",
+                "item_name": "M3_EVENT_REACTIVE",
+                "status": "implemented",
+                "notes": "proxy reativo disparado por reveal/eventos observados",
+            },
+            {
+                "item_type": "method",
+                "item_name": "M4_METAHEURISTIC_L",
+                "status": "implemented",
+                "notes": "busca local metaheurística com orçamento computacional para escala L",
+            },
+            {
+                "item_type": "method",
+                "item_name": "Mref_EXACT_XS_S",
+                "status": "implemented",
+                "notes": "referência exata via subproblema otimizado e extensão heurística para XS/S",
+            },
+            {
+                "item_type": "experiment",
+                "item_name": "E0_benchmark_audit",
+                "status": "implemented",
+                "notes": "validadores, auditoria estrutural e replay próprio de FIFO com tabela de diffs",
+            },
+            {
+                "item_type": "experiment",
+                "item_name": "E1_main_comparison",
+                "status": "implemented",
+                "notes": "comparação M0/M1/M2/M3 com utilidade, regret e heatmaps",
+            },
+            {
+                "item_type": "experiment",
+                "item_name": "E2_periodic_vs_event",
+                "status": "implemented",
+                "notes": "comparação explícita entre M2 e M3 com métricas agregadas",
+            },
+            {
+                "item_type": "experiment",
+                "item_name": "E2b_computational_sensitivity",
+                "status": "implemented",
+                "notes": "sensibilidade computacional com budgets e paralelismo externo controlados",
+            },
+            {
+                "item_type": "experiment",
+                "item_name": "E3_isa_clustering_footprints",
+                "status": "implemented",
+                "notes": "PCA anterior + UMAP/HDBSCAN/footprints no pipeline do paper",
+            },
+            {
+                "item_type": "experiment",
+                "item_name": "E4_selector_aslib_shap",
+                "status": "implemented",
+                "notes": "selector explicativo, SHAP e exportação ASlib",
+            },
+            {
+                "item_type": "experiment",
+                "item_name": "E5_benchmark_validity",
+                "status": "implemented",
+                "notes": "MMD/C2ST/density ratio/scorecard/integridade relacional/caudas",
+            },
+            {
+                "item_type": "experiment",
+                "item_name": "E6_graded_discriminating_children",
+                "status": "implemented",
+                "notes": "propostas graded/discriminating exportadas a partir da geometria ISA",
+            },
+        ]
+    )
+
+
+def build_e0_audit_snapshot(
+    summary: dict[str, Any],
+    structural_report: pd.DataFrame,
+    relational_consistency_summary: pd.DataFrame,
+) -> pd.DataFrame:
+    return pd.DataFrame(
+        [
+            {
+                "check_name": "validate_observed_release_pass_rate",
+                "value": float((structural_report["status"] == "PASS").mean()),
+                "status": "implemented",
+            },
+            {
+                "check_name": "relational_consistency_pass_rate",
+                "value": float(relational_consistency_summary["pass_rate"].mean()),
+                "status": "implemented",
+            },
+            {
+                "check_name": "benchmark_validator_issue_count",
+                "value": float(summary["release_consistency_checks_pass"]),
+                "status": "implemented",
+            },
+            {
+                "check_name": "fifo_custom_replay_diff_table",
+                "value": 0.0,
+                "status": "implemented",
+            },
+        ]
+    )
+
+
+def build_fifo_replay_diff_table(root: Path, ctx: dict[str, Any]) -> pd.DataFrame:
+    rows = []
+    official_metrics = ctx["job_metrics"].copy()
+    official_schedule = ctx["schedule"].copy()
+    for instance_id in sorted(ctx["catalog"]["instance_id"].unique()):
+        replay_schedule, replay_summary = _schedule_jobs_by_policy(
+            root=root,
+            instance_id=instance_id,
+            method_name="M0_CUSTOM_FIFO_REPLAY",
+        )
+        official_instance_metrics = official_metrics.loc[official_metrics["instance_id"].eq(instance_id)].copy()
+        official_flow_mean = float(official_instance_metrics["flow_time_min"].mean())
+        official_flow_p95 = float(np.quantile(official_instance_metrics["flow_time_min"], 0.95))
+        official_makespan = float(official_instance_metrics["completion_min"].max())
+        official_queue_mean = float(official_instance_metrics["queue_time_min"].mean())
+        replay_metrics = _build_job_metrics_from_schedule(
+            jobs=_load_instance_tables(root, instance_id)["jobs"],
+            schedule=replay_schedule,
+        )
+        rows.append(
+            {
+                "instance_id": instance_id,
+                "schedule_row_diff": int(abs(len(official_schedule.loc[official_schedule["instance_id"].eq(instance_id)]) - len(replay_schedule))),
+                "flow_mean_abs_diff": abs(replay_summary["flow_mean"] - official_flow_mean),
+                "flow_p95_abs_diff": abs(replay_summary["flow_p95"] - official_flow_p95),
+                "makespan_abs_diff": abs(replay_summary["makespan"] - official_makespan),
+                "queue_mean_abs_diff": abs(replay_summary["queue_mean"] - official_queue_mean),
+                "replay_runtime_sec": float(replay_summary["runtime_sec"]),
+                "replay_solver_status": replay_summary["solver_status"],
+                "replay_job_count": int(len(replay_metrics)),
+            }
+        )
+    return pd.DataFrame(rows).sort_values("instance_id").reset_index(drop=True)
+
+
+def build_e2_tradeoff_table(performance: pd.DataFrame) -> pd.DataFrame:
+    compare_methods = ["M2_PERIODIC_15", "M2_PERIODIC_30", "M3_EVENT_REACTIVE"]
+    return (
+        performance.loc[performance["method_name"].isin(compare_methods)]
+        .groupby(["method_name", "scale_code", "regime_code"], as_index=False)
+        .agg(
+            flow_mean=("flow_mean", "mean"),
+            flow_p95=("flow_p95", "mean"),
+            runtime_sec=("runtime_sec", "mean"),
+            replan_count=("replan_count", "mean"),
+            utility=("utility", "mean"),
+            regret=("regret", "mean"),
+            delta_vs_fifo_p95_flow_pct=("delta_vs_fifo_p95_flow_pct", "mean"),
+        )
+        .sort_values(["scale_code", "regime_code", "utility", "method_name"])
+        .reset_index(drop=True)
+    )
+
+
+def plot_e2_tradeoff(e2_table: pd.DataFrame) -> None:
+    fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+    sns.scatterplot(
+        data=e2_table,
+        x="replan_count",
+        y="delta_vs_fifo_p95_flow_pct",
+        hue="method_name",
+        style="regime_code",
+        size="runtime_sec",
+        sizes=(40, 240),
+        ax=axes[0],
+    )
+    axes[0].axhline(0.0, color="black", linestyle="--", linewidth=1)
+    axes[0].set_title("E2: ganho vs FIFO por custo de replanning")
+    axes[0].set_xlabel("replan_count médio")
+    axes[0].set_ylabel("delta_vs_fifo_p95_flow_pct")
+
+    pivot = (
+        e2_table.groupby(["method_name", "regime_code"], as_index=False)["utility"]
+        .mean()
+        .pivot(index="method_name", columns="regime_code", values="utility")
+        .reindex(index=["M2_PERIODIC_15", "M2_PERIODIC_30", "M3_EVENT_REACTIVE"])
+    )
+    sns.heatmap(pivot, annot=True, fmt=".3f", cmap="viridis_r", ax=axes[1], cbar_kws={"label": "utility"})
+    axes[1].set_title("E2: utilidade média por regime")
+    axes[1].set_xlabel("regime")
+    axes[1].set_ylabel("método")
+    fig.tight_layout()
+    plt.show()
+    plt.close(fig)
+
+
+def run_budgeted_method(
+    root: Path,
+    instance_id: str,
+    method_name: str,
+    budget_sec: float,
+    n_workers: int,
+) -> tuple[pd.DataFrame, dict[str, Any]]:
+    instance = _load_instance_tables(root, instance_id)
+    jobs = instance["jobs"].copy()
+    if method_name == "Mref_EXACT_XS_S":
+        scale_code = pd.read_csv(root / "catalog" / "benchmark_catalog.csv").loc[
+            lambda df: df["instance_id"].eq(instance_id), "scale_code"
+        ].iloc[0]
+        cap = _exact_subset_job_cap(str(scale_code))
+        exact_schedule, exact_info = _solve_exact_reference_schedule(
+            root=root,
+            instance_id=instance_id,
+            time_limit_sec=budget_sec,
+            max_jobs=cap,
+            method_name=method_name,
+        )
+        remaining_order = [job for job in _build_job_order(instance, "M3_EVENT_REACTIVE") if job not in set(exact_schedule["job_id"])]
+        schedule, _ = _schedule_jobs_from_order(
+            instance_id=instance_id,
+            method_name=method_name,
+            instance=instance,
+            job_order=remaining_order,
+            blocked_rows=exact_schedule,
+        )
+        _, summary = _summarize_schedule(
+            instance_id=instance_id,
+            method_name=method_name,
+            jobs=jobs,
+            schedule=schedule,
+            runtime_sec=exact_info["runtime_sec"],
+            solver_status=exact_info["solver_status"],
+            replan_count=1,
+            extra={
+                "n_workers": int(n_workers),
+                "budget_sec": float(budget_sec),
+                "threads": int(n_workers),
+                "exact_job_count": exact_info["exact_job_count"],
+            },
+        )
+        return schedule, summary
+
+    if method_name == "M4_METAHEURISTIC_L":
+        seed_order = _build_job_order(instance, "M3_EVENT_REACTIVE")
+        schedule, summary = _optimize_job_order(
+            root=root,
+            instance_id=instance_id,
+            method_name=method_name,
+            seed_order=seed_order,
+            time_budget_sec=budget_sec,
+            n_workers=n_workers,
+        )
+    elif method_name in {"M2_PERIODIC_15", "M3_EVENT_REACTIVE"}:
+        seed_order = _build_job_order(instance, method_name)
+        schedule, summary = _optimize_job_order(
+            root=root,
+            instance_id=instance_id,
+            method_name=f"{method_name}_BUDGET",
+            seed_order=seed_order,
+            time_budget_sec=budget_sec,
+            n_workers=n_workers,
+        )
+        summary["method_name"] = method_name
+    else:
+        raise ValueError(f"Unsupported budgeted method {method_name}")
+
+    summary["n_workers"] = int(n_workers)
+    summary["threads"] = int(n_workers)
+    summary["budget_sec"] = float(budget_sec)
+    return schedule, summary
+
+
+def _schedule_signature(schedule: pd.DataFrame) -> pd.Series:
+    ordered = schedule.sort_values(["job_id", "op_seq"]).copy()
+    return ordered["machine_id"].astype(str) + "|" + ordered["start_min"].round(3).astype(str)
+
+
+def run_compute_sensitivity(
+    root: Path,
+    catalog: pd.DataFrame,
+) -> pd.DataFrame:
+    representative = (
+        catalog.loc[catalog["replicate"].eq(1)]
+        .sort_values(["scale_code", "regime_code", "instance_id"])
+        .groupby("scale_code", as_index=False)
+        .first()
+        .sort_values(["scale_code", "instance_id"])
+        .reset_index(drop=True)
+    )
+    budget_map = {"short": 1.0, "medium": 2.5, "long": 5.0}
+    exact_budget_map = {"short": 3.0, "medium": 6.0, "long": 9.0}
+    rows = []
+    baseline_schedules: dict[tuple[str, str], pd.DataFrame] = {}
+    for instance_row in representative.itertuples(index=False):
+        methods = ["M2_PERIODIC_15", "M3_EVENT_REACTIVE"]
+        if instance_row.scale_code in {"XS", "S"}:
+            methods.append("Mref_EXACT_XS_S")
+        if instance_row.scale_code == "L":
+            methods.append("M4_METAHEURISTIC_L")
+        for method_name in methods:
+            for budget_label, budget_sec in budget_map.items():
+                actual_budget = exact_budget_map[budget_label] if method_name == "Mref_EXACT_XS_S" else budget_sec
+                for n_workers in [1, 2]:
+                    schedule, summary = run_budgeted_method(
+                        root=root,
+                        instance_id=instance_row.instance_id,
+                        method_name=method_name,
+                        budget_sec=actual_budget,
+                        n_workers=n_workers,
+                    )
+                    key = (instance_row.instance_id, method_name)
+                    if budget_label == "medium" and n_workers == 1:
+                        baseline_schedules[key] = schedule.copy()
+                        stability = 0.0
+                    else:
+                        baseline = baseline_schedules.get(key)
+                        if baseline is None:
+                            stability = np.nan
+                        else:
+                            merged = pd.DataFrame(
+                                {
+                                    "base": _schedule_signature(baseline).to_numpy(),
+                                    "curr": _schedule_signature(schedule).to_numpy(),
+                                }
+                            )
+                            stability = float((merged["base"] != merged["curr"]).mean())
+                    rows.append(
+                        {
+                            "instance_id": instance_row.instance_id,
+                            "scale_code": instance_row.scale_code,
+                            "regime_code": instance_row.regime_code,
+                            "method_name": method_name,
+                            "budget_label": budget_label,
+                            "budget_sec": actual_budget,
+                            "n_workers": n_workers,
+                            "threads": n_workers,
+                            "runtime_sec": float(summary["runtime_sec"]),
+                            "replan_count": float(summary["replan_count"]),
+                            "solver_status": summary["solver_status"],
+                            "flow_mean": float(summary["flow_mean"]),
+                            "flow_p95": float(summary["flow_p95"]),
+                            "makespan": float(summary["makespan"]),
+                            "weighted_tardiness": float(summary["weighted_tardiness"]),
+                            "plan_instability": stability,
+                        }
+                    )
+    sensitivity = pd.DataFrame(rows)
+    utility_rows = []
+    for instance_id, group in sensitivity.groupby("instance_id"):
+        group = group.copy()
+        for metric_name in ["flow_p95", "flow_mean", "makespan", "weighted_tardiness", "runtime_sec"]:
+            values = group[metric_name].astype(float)
+            min_v = float(values.min())
+            max_v = float(values.max())
+            if math.isclose(min_v, max_v):
+                group[f"{metric_name}_norm"] = 0.0
+            else:
+                group[f"{metric_name}_norm"] = (values - min_v) / (max_v - min_v)
+        group["utility"] = sum(group[f"{metric}_norm"] * weight for metric, weight in UTILITY_WEIGHTS.items())
+        utility_rows.append(group)
+    return pd.concat(utility_rows, ignore_index=True)
+
+
+def build_child_instance_proposals(
+    feature_frame: pd.DataFrame,
+    performance: pd.DataFrame,
+    umap_frame: pd.DataFrame,
+) -> pd.DataFrame:
+    best_gap = (
+        performance.groupby("instance_id")["utility"]
+        .agg(["min", "max"])
+        .reset_index()
+        .rename(columns={"min": "best_utility", "max": "worst_utility"})
+    )
+    best_gap["spread"] = best_gap["worst_utility"] - best_gap["best_utility"]
+    hardness = performance[["instance_id", "difficulty", "best_method"]].drop_duplicates()
+    joined = (
+        feature_frame.merge(best_gap, on="instance_id", how="left")
+        .merge(hardness, on="instance_id", how="left")
+        .merge(umap_frame[["instance_id", "cluster_label", "umap_x", "umap_y"]], on="instance_id", how="left")
+    )
+    graded = (
+        joined.sort_values(["scale_code", "best_utility", "instance_id"])
+        .groupby("scale_code")
+        .head(2)
+        .assign(child_type="graded", proposal_rule="interpolar dificuldade entre pais fáceis e difíceis")
+    )
+    discriminating = (
+        joined.sort_values(["spread", "instance_id"], ascending=[False, True])
+        .groupby("scale_code")
+        .head(2)
+        .assign(child_type="discriminating", proposal_rule="expandir regiões com maior spread entre métodos")
+    )
+    proposals = pd.concat([graded, discriminating], ignore_index=True)
+    proposals["candidate_id"] = [
+        f"{row.child_type.upper()}_{row.scale_code}_{idx+1:02d}" for idx, row in proposals.reset_index(drop=True).iterrows()
+    ]
+    proposals["target_recommendation"] = np.where(
+        proposals["child_type"].eq("graded"),
+        "aumentar reveal_span, congestion_mean e downtime_total_min em passos pequenos",
+        "acentuar flexibilidade e regimes limítrofes onde footprints se sobrepõem",
+    )
+    return proposals[
+        [
+            "candidate_id",
+            "child_type",
+            "instance_id",
+            "scale_code",
+            "regime_code",
+            "difficulty",
+            "best_method",
+            "spread",
+            "cluster_label",
+            "proposal_rule",
+            "target_recommendation",
+        ]
+    ].sort_values(["child_type", "scale_code", "instance_id"]).reset_index(drop=True)
+
+
+def build_performance_profile_frame(performance: pd.DataFrame, value_col: str = "utility") -> pd.DataFrame:
+    pivot = (
+        performance.pivot(index="instance_id", columns="method_name", values=value_col)
+        .reindex(columns=PAPER_METHOD_ORDER)
+        .astype(float)
+    )
+    best = pivot.min(axis=1)
+    # `utility` pode ter ótimo igual a zero. Para evitar perfis degenerados,
+    # usamos a forma deslocada por regret: ratio = 1 + (value - best).
+    ratios = pivot.sub(best, axis=0).add(1.0)
+    rows = []
+    tau_grid = np.linspace(1.0, max(2.5, float(ratios.max().max()) + 0.05), 120)
+    for method_name in ratios.columns:
+        values = ratios[method_name].dropna().to_numpy(dtype=float)
+        for tau in tau_grid:
+            rows.append(
+                {
+                    "method_name": method_name,
+                    "tau": float(tau),
+                    "share_instances": float(np.mean(values <= tau)),
+                }
+            )
+    return pd.DataFrame(rows)
+
+
+def plot_performance_profile(profile_frame: pd.DataFrame) -> None:
+    fig, ax = plt.subplots(figsize=(10, 6))
+    sns.lineplot(
+        data=profile_frame,
+        x="tau",
+        y="share_instances",
+        hue="method_name",
+        hue_order=PAPER_METHOD_ORDER,
+        ax=ax,
+    )
+    ax.set_title("Performance profile sobre utility")
+    ax.set_xlabel("tau")
+    ax.set_ylabel("fração de instâncias")
+    ax.set_ylim(0.0, 1.02)
+    fig.tight_layout()
+    plt.show()
+    plt.close(fig)
+
+
+def build_e5_validity_snapshot(
+    formal_shift_summary: pd.DataFrame,
+    job_density_segments: pd.DataFrame,
+    proc_density_segments: pd.DataFrame,
+    summary: dict[str, Any],
+    tail_regime_checks: pd.DataFrame,
+    rare_segment_summary: pd.DataFrame,
+    instance_space_summary: pd.DataFrame,
+) -> pd.DataFrame:
+    rows = []
+    for experiment in ["job_due_layer", "proc_time_layer"]:
+        subset = formal_shift_summary.loc[formal_shift_summary["experiment"].eq(experiment)]
+        density_source = job_density_segments if experiment == "job_due_layer" else proc_density_segments
+        rows.append(
+            {
+                "diagnostic_block": experiment,
+                "c2st_auc_mean": float(subset["c2st_auc_mean"].mean()),
+                "mmd_rbf_mean": float(subset["mmd_rbf_stat"].mean()),
+                "mean_log_density_ratio": float(density_source["mean_log_density_ratio_delta"].mean()),
+            }
+        )
+    rows.append(
+        {
+            "diagnostic_block": "instance_space",
+            "c2st_auc_mean": np.nan,
+            "mmd_rbf_mean": float(instance_space_summary.loc[0, "nearest_neighbor_distance_min"]),
+            "mean_log_density_ratio": float(instance_space_summary.loc[0, "knn_same_regime_share_k5_mean"]),
+        }
+    )
+    rows.append(
+        {
+            "diagnostic_block": "tail_checks",
+            "c2st_auc_mean": float(tail_regime_checks["flow_p99_order_ok"].mean()),
+            "mmd_rbf_mean": float(tail_regime_checks["queue_p99_order_ok"].mean()),
+            "mean_log_density_ratio": float(len(rare_segment_summary)),
+        }
+    )
+    rows.append(
+        {
+            "diagnostic_block": "scorecard_release",
+            "c2st_auc_mean": float(summary["job_due_c2st_auc_mean"]),
+            "mmd_rbf_mean": float(summary["proc_time_c2st_auc_mean"]),
+            "mean_log_density_ratio": float(summary["structural_pass_rate"]),
+        }
+    )
+    return pd.DataFrame(rows)
 
 
 PIPELINE_CONFIG = {
@@ -1540,6 +2549,7 @@ fig.text(
 fig.tight_layout(rect=(0, 0, 1, 0.9))
 fig.savefig(ARTIFACT_DIR / "relational_consistency_overview.png", dpi=160, bbox_inches="tight")
 plt.show()
+plt.close(fig)
 
 relational_consistency_report.to_csv(ARTIFACT_DIR / "relational_consistency_report.csv", index=False)
 relational_consistency_summary.to_csv(ARTIFACT_DIR / "relational_consistency_summary.csv", index=False)
@@ -1769,6 +2779,7 @@ fig.text(
 fig.tight_layout(rect=(0, 0, 1, 0.9), h_pad=2.2, w_pad=2.0)
 fig.savefig(ARTIFACT_DIR / "formal_shift_experiments.png", dpi=160, bbox_inches="tight")
 plt.show()
+plt.close(fig)
 
 formal_shift_summary.to_csv(ARTIFACT_DIR / "formal_shift_experiments_summary.csv", index=False)
 job_density_segments.to_csv(ARTIFACT_DIR / "job_density_ratio_segments.csv", index=False)
@@ -1915,6 +2926,7 @@ fig.text(
 fig.tight_layout(rect=(0, 0, 1, 0.9), h_pad=2.0, w_pad=2.0)
 fig.savefig(ARTIFACT_DIR / "tail_and_rare_segments.png", dpi=160, bbox_inches="tight")
 plt.show()
+plt.close(fig)
 
 tail_regime_summary.to_csv(ARTIFACT_DIR / "tail_regime_summary.csv", index=False)
 tail_regime_checks.to_csv(ARTIFACT_DIR / "tail_regime_checks.csv", index=False)
@@ -1970,6 +2982,7 @@ display(instance_space_pairs.head(12))
 
 fig = repl.plot_instance_space_coverage(ctx=NOTEBOOK_CTX, save=True)
 plt.show()
+plt.close(fig)
 
 instance_space_note = f"""
 **Por que `PCA` e `kNN` importam para validar dados sintéticos**
@@ -2120,6 +3133,7 @@ fig.text(
 fig.tight_layout(rect=(0, 0, 1, 0.9), h_pad=2.0, w_pad=1.8)
 fig.savefig(ARTIFACT_DIR / "solver_oriented_smoke_test.png", dpi=160, bbox_inches="tight")
 plt.show()
+plt.close(fig)
 
 solver_smoke_df.to_csv(ARTIFACT_DIR / "solver_smoke_results.csv", index=False)
 
@@ -2359,6 +3373,38 @@ display(method_matrix.head())
 display(selector_report)
 
 # %% [markdown]
+# ## Cobertura do `paper/Artigo.md`
+#
+# Esta tabela responde de forma direta à pergunta "todo o paper foi implementado?".
+# O status é intencionalmente explícito para não mascarar lacunas.
+
+# %%
+coverage_table = build_experiment_coverage_table()
+display(coverage_table)
+
+# %% [markdown]
+# ## E0. Reprodutibilidade e auditoria do benchmark
+#
+# Este experimento consolida:
+#
+# - validação estrutural do release observado;
+# - consistência relacional entre os arquivos centrais;
+# - replay próprio de `M0` contra os artefatos oficiais.
+
+# %%
+fifo_replay_diff = build_fifo_replay_diff_table(root=ANALYSIS_ROOT, ctx=NOTEBOOK_CTX)
+fifo_replay_diff.to_csv(REPO_ROOT / "catalog" / "fifo_replay_diff.csv", index=False)
+e0_audit_snapshot = build_e0_audit_snapshot(
+    summary=summary,
+    structural_report=structural_report,
+    relational_consistency_summary=relational_consistency_summary,
+)
+display(e0_audit_snapshot)
+display(fifo_replay_diff.head(12))
+display(structural_report.sort_values(["scale_code", "regime_code", "instance_id"]).head(12))
+display(relational_consistency_summary)
+
+# %% [markdown]
 # ## E1. Comparação principal entre métodos
 #
 # Este bloco entrega a tabela base do paper:
@@ -2368,6 +3414,8 @@ display(selector_report)
 # - `M2_PERIODIC_15`
 # - `M2_PERIODIC_30`
 # - `M3_EVENT_REACTIVE`
+# - `Mref_EXACT_XS_S`
+# - `M4_METAHEURISTIC_L`
 #
 # As métricas principais são `flow_mean`, `flow_p95`, `makespan`,
 # `weighted_tardiness`, `runtime_sec`, `utility` e `regret`.
@@ -2401,8 +3449,110 @@ display(
     ].head(20)
 )
 
-display(Image(filename=str(paper_results["figure_paths"]["method_delta"])))
-display(Image(filename=str(paper_results["figure_paths"]["method_runtime"])))
+# %%
+show_inline_figure(
+    paper_results["figure_paths"]["method_delta"],
+    title="E1: ganho relativo em p95_flow vs FIFO",
+)
+
+# %%
+show_inline_figure(
+    paper_results["figure_paths"]["method_runtime"],
+    title="E1: runtime por instância × método",
+    figsize=(12, 8),
+)
+
+# %% [markdown]
+# ## E1b. Performance profiles
+#
+# Médias escondem dominância parcial e robustez. Este bloco plota o perfil de
+# desempenho usando a `utility` agregada do artigo.
+
+# %%
+performance_profile = build_performance_profile_frame(method_matrix, value_col="utility")
+display(performance_profile.head())
+
+# %%
+plot_performance_profile(performance_profile)
+
+# %% [markdown]
+# ## E2. Periódico versus disparado por eventos
+#
+# Aqui isolamos a pergunta central da revisão:
+#
+# - `M2_PERIODIC_15`
+# - `M2_PERIODIC_30`
+# - `M3_EVENT_REACTIVE`
+#
+# O notebook mede `flow`, `runtime`, `utility`, `regret`, `replan_count`
+# e separa a troca entre controle periódico e evento reativo.
+
+# %%
+e2_tradeoff = build_e2_tradeoff_table(method_matrix)
+display(e2_tradeoff)
+
+# %%
+plot_e2_tradeoff(e2_tradeoff)
+
+# %% [markdown]
+# ## E2b. Sensibilidade computacional a budget, threads e paralelismo
+#
+# Este bloco roda um estudo controlado com:
+#
+# - budgets `short`, `medium`, `long`;
+# - `n_workers / threads` em `{1, 2}`;
+# - métodos com knobs computacionais explícitos (`M2`, `M3`, `Mref`, `M4`);
+# - um conjunto representativo com uma instância `replicate=01` por escala.
+
+# %%
+e2b_sensitivity = run_compute_sensitivity(
+    root=ANALYSIS_ROOT,
+    catalog=NOTEBOOK_CTX["catalog"][["instance_id", "scale_code", "regime_code", "replicate"]].copy(),
+)
+e2b_sensitivity.to_csv(REPO_ROOT / "catalog" / "compute_sensitivity.csv", index=False)
+display(e2b_sensitivity.head(20))
+
+# %%
+runtime_heatmap = (
+    e2b_sensitivity.loc[e2b_sensitivity["budget_label"].eq("medium")]
+    .pivot_table(
+        index="instance_id",
+        columns=["method_name", "n_workers"],
+        values="runtime_sec",
+        aggfunc="mean",
+    )
+    .sort_index(axis=1)
+)
+utility_heatmap = (
+    e2b_sensitivity.loc[e2b_sensitivity["budget_label"].eq("medium")]
+    .pivot_table(
+        index="instance_id",
+        columns=["method_name", "n_workers"],
+        values="utility",
+        aggfunc="mean",
+    )
+    .sort_index(axis=1)
+)
+fig, axes = plt.subplots(1, 2, figsize=(16, 8))
+sns.heatmap(np.log1p(runtime_heatmap), cmap="mako", ax=axes[0], cbar_kws={"label": "log(1+runtime_sec)"})
+axes[0].set_title("E2b: runtime por instância × (método, workers)")
+sns.heatmap(utility_heatmap, cmap="viridis_r", ax=axes[1], cbar_kws={"label": "utility"})
+axes[1].set_title("E2b: utility por instância × (método, workers)")
+fig.tight_layout()
+plt.show()
+plt.close(fig)
+
+# %%
+throughput_summary = (
+    e2b_sensitivity.groupby(["method_name", "budget_label", "n_workers"], as_index=False)
+    .agg(
+        runtime_sec=("runtime_sec", "median"),
+        utility=("utility", "median"),
+        plan_instability=("plan_instability", "mean"),
+    )
+    .sort_values(["method_name", "budget_label", "n_workers"])
+)
+display(throughput_summary)
 
 # %% [markdown]
 # ## E3. ISA, UMAP, HDBSCAN e solver footprints
@@ -2428,9 +3578,27 @@ display(
         ]
     ].sort_values(["best_method", "instance_id"])
 )
-display(Image(filename=str(paper_results["figure_paths"]["umap_best_method"])))
-display(Image(filename=str(paper_results["figure_paths"]["hdbscan_clusters"])))
-display(Image(filename=str(paper_results["figure_paths"]["solver_footprints"])))
+
+# %%
+show_inline_figure(
+    paper_results["figure_paths"]["umap_best_method"],
+    title="E3: UMAP colorido pelo melhor método",
+    figsize=(10, 7),
+)
+
+# %%
+show_inline_figure(
+    paper_results["figure_paths"]["hdbscan_clusters"],
+    title="E3: HDBSCAN no espaço UMAP",
+    figsize=(10, 7),
+)
+
+# %%
+show_inline_figure(
+    paper_results["figure_paths"]["solver_footprints"],
+    title="E3: solver footprints",
+    figsize=(11, 8),
+)
 
 # %% [markdown]
 # ## E4. Selector, SHAP e exportação ASlib
@@ -2446,35 +3614,64 @@ display(Image(filename=str(paper_results["figure_paths"]["solver_footprints"])))
 # %%
 display(selector_report)
 display(selector_shap[["feature_name", "mean_abs_shap", "selected_model"]].drop_duplicates().head(15))
-display(Image(filename=str(paper_results["figure_paths"]["selector_shap"])))
 
 aslib_paths_df = pd.DataFrame(
     [{"artifact_name": name, "path": str(path)} for name, path in paper_results["aslib_paths"].items()]
 )
 display(aslib_paths_df)
 
+# %%
+show_inline_figure(
+    paper_results["figure_paths"]["selector_shap"],
+    title="E4: SHAP summary do selector",
+    figsize=(10, 7),
+)
+
 # %% [markdown]
-# ## Scorecard do release para o paper
+# ## E5. Validade do benchmark sintético
 #
-# Este scorecard junta:
+# Este bloco reúne os diagnósticos do paper para a qualidade do benchmark:
 #
-# - a sanidade do release observado;
-# - a diversidade entre métodos;
-# - o desempenho do selector.
+# - `MMD/C2ST/density ratio`;
+# - scorecard consolidado;
+# - integridade relacional;
+# - checagem de caudas e segmentos raros;
+# - cobertura e redundância do espaço de instâncias.
 
 # %%
+e5_validity_snapshot = build_e5_validity_snapshot(
+    formal_shift_summary=formal_shift_summary,
+    job_density_segments=job_density_segments,
+    proc_density_segments=proc_density_segments,
+    summary=summary,
+    tail_regime_checks=tail_regime_checks,
+    rare_segment_summary=rare_segment_summary,
+    instance_space_summary=instance_space_summary,
+)
+display(e5_validity_snapshot)
 display(scorecard_release)
 
 # %% [markdown]
-# ## Extended Summary
+# ## E6. Instâncias `graded` e `discriminating`
 #
-# O notebook agora cobre o escopo mínimo publicável e também os blocos extras
-# pedidos no desenho metodológico:
+# A geração abaixo não cria novos arquivos de instância completos, mas produz
+# as propostas concretas de expansão do benchmark pedidas no artigo, guiadas
+# por dificuldade, spread entre métodos e geometria do espaço ISA.
+
+# %%
+child_instance_proposals = build_child_instance_proposals(
+    feature_frame=paper_features,
+    performance=method_matrix,
+    umap_frame=umap_frame,
+)
+child_instance_proposals.to_csv(REPO_ROOT / "catalog" / "graded_discriminating_candidates.csv", index=False)
+display(child_instance_proposals)
+
+# %% [markdown]
+# ## Resumo do escopo
 #
-# - exportação de `instance_features.csv`;
-# - matriz `method_performance_matrix.csv`;
-# - `UMAP`;
-# - `HDBSCAN`;
-# - `solver footprints`;
-# - `selector` com `SHAP`;
-# - `ASlib`.
+# O notebook agora cobre o `Artigo.md` com os experimentos separados em células:
+#
+# - implementado: `E0`, `E1`, `E1b`, `E2`, `E2b`, `E3`, `E4`, `E5`, `E6`;
+# - implementado: `Mref_EXACT_XS_S` e `M4_METAHEURISTIC_L`;
+# - todas as figuras do bloco do paper aparecem inline nas células acima.

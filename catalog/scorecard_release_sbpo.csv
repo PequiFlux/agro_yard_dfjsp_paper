@@ -3,7 +3,7 @@ structural_pass_rate,1.0
 release_consistency_checks_pass,0.0
 flow_regime_order_checks_pass,1.0
 instance_space_exact_duplicate_checks_pass,1.0
-method_count,5.0
+method_count,7.0
 best_method_diversity,1.0
 selector_top1_accuracy,1.0
 selector_macro_f1,1.0
