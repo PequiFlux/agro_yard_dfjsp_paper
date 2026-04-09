@@ -31,6 +31,7 @@ de origem.
 ## Estrutura de trabalho
 
 - `paper/Artigo.md`: desenho experimental e metodológico do artigo
+- `output/jupyter-notebook/agro-yard-paper-benchmark-and-selection.ipynb`: notebook principal que implementa o desenho do paper em fluxo único reproduzível
 - `paper/assets/`: figuras, tabelas e anexos do manuscrito
 - `experiments/`: novos códigos e pipelines do paper
 - `results/`: saídas reproduzíveis dos experimentos do paper
@@ -86,6 +87,10 @@ Execução headless do notebook:
 ```bash
 docker compose run --rm paper-exec
 ```
+
+O alvo padrão do runner headless é:
+
+- `output/jupyter-notebook/agro-yard-paper-benchmark-and-selection.ipynb`
 
 Se o notebook principal do paper ainda não existir, o runner executa um
 notebook mínimo de sanity check do ambiente para validar kernel, imports e

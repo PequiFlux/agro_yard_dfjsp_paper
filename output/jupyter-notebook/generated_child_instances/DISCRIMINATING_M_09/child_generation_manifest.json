@@ -1,35 +1,17 @@
 {
   "candidate_id": "DISCRIMINATING_M_09",
-  "parent_instance_id": "GO_M_DISRUPTED_03",
+  "parent_instance_id": "GO_M_BALANCED_03",
   "child_type": "discriminating",
   "scale_code": "M",
-  "regime_code": "disrupted",
-  "family_rank": 2,
-  "generation_intensity": 0.28,
+  "regime_code": "balanced",
+  "family_rank": 1,
+  "generation_intensity": 0.18,
   "proposal_rule": "expandir regi\u00f5es com maior spread entre m\u00e9todos",
   "target_recommendation": "acentuar flexibilidade e regimes lim\u00edtrofes onde footprints se sobrep\u00f5em",
   "transform_meta": {
-    "top_jobs_constrained": 23,
+    "top_jobs_constrained": 17,
     "constrained_rows": [
       [
-        "J0002",
-        1,
-        3,
-        1
-      ],
-      [
-        "J0002",
-        3,
-        3,
-        1
-      ],
-      [
-        "J0002",
-        4,
-        3,
-        1
-      ],
-      [
         "J0003",
         1,
         3,
@@ -38,7 +20,7 @@
       [
         "J0003",
         3,
-        2,
+        3,
         1
       ],
       [
@@ -174,132 +156,6 @@
         1
       ],
       [
-        "J0011",
-        1,
-        3,
-        1
-      ],
-      [
-        "J0011",
-        3,
-        3,
-        1
-      ],
-      [
-        "J0011",
-        4,
-        3,
-        1
-      ],
-      [
-        "J0012",
-        1,
-        3,
-        1
-      ],
-      [
-        "J0012",
-        3,
-        3,
-        1
-      ],
-      [
-        "J0012",
-        4,
-        3,
-        1
-      ],
-      [
-        "J0013",
-        1,
-        3,
-        1
-      ],
-      [
-        "J0013",
-        3,
-        3,
-        1
-      ],
-      [
-        "J0013",
-        4,
-        3,
-        1
-      ],
-      [
-        "J0014",
-        1,
-        3,
-        1
-      ],
-      [
-        "J0014",
-        3,
-        3,
-        1
-      ],
-      [
-        "J0014",
-        4,
-        3,
-        1
-      ],
-      [
-        "J0015",
-        1,
-        3,
-        1
-      ],
-      [
-        "J0015",
-        3,
-        2,
-        1
-      ],
-      [
-        "J0015",
-        4,
-        3,
-        1
-      ],
-      [
-        "J0016",
-        1,
-        3,
-        1
-      ],
-      [
-        "J0016",
-        3,
-        3,
-        1
-      ],
-      [
-        "J0016",
-        4,
-        3,
-        1
-      ],
-      [
-        "J0017",
-        1,
-        3,
-        1
-      ],
-      [
-        "J0017",
-        3,
-        3,
-        1
-      ],
-      [
-        "J0017",
-        4,
-        3,
-        1
-      ],
-      [
         "J0018",
         1,
         3,
@@ -390,44 +246,80 @@
         1
       ],
       [
-        "J0036",
+        "J0023",
         1,
         3,
         1
       ],
       [
-        "J0036",
+        "J0023",
         3,
         3,
         1
       ],
       [
-        "J0036",
+        "J0023",
         4,
         3,
         1
       ],
       [
-        "J0037",
+        "J0024",
         1,
         3,
         1
       ],
       [
-        "J0037",
+        "J0024",
         3,
         3,
         1
       ],
       [
-        "J0037",
+        "J0024",
+        4,
+        3,
+        1
+      ],
+      [
+        "J0033",
+        1,
+        3,
+        1
+      ],
+      [
+        "J0033",
+        3,
+        3,
+        1
+      ],
+      [
+        "J0033",
+        4,
+        3,
+        1
+      ],
+      [
+        "J0034",
+        1,
+        3,
+        1
+      ],
+      [
+        "J0034",
+        3,
+        3,
+        1
+      ],
+      [
+        "J0034",
         4,
         3,
         1
       ]
     ],
     "hotspot_machines": [
-      "HOP4",
+      "HOP1",
       "LAB1"
     ]
   }

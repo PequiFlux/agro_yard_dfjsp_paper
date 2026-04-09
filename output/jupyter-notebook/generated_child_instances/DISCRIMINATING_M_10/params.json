@@ -3,9 +3,9 @@
   "dataset_version": "1.1.0-observed-child",
   "instance_id": "DISCRIMINATING_M_10",
   "scale_code": "M",
-  "regime_code": "balanced",
-  "replicate": 2,
-  "random_seed": 32111,
+  "regime_code": "disrupted",
+  "replicate": 1,
+  "random_seed": 31333,
   "time_unit": "minute",
   "load_unit": "ton",
   "currency": "BRL",
@@ -14,11 +14,11 @@
   "shift_close_min": 720,
   "antt_statutory_wait_limit_min": 300,
   "antt_wait_cost_rs_per_ton_hour": 2.41,
-  "notes": "Derived child instance generated in-notebook from GO_M_BALANCED_02 using discriminating ISA-guided transform.",
+  "notes": "Derived child instance generated in-notebook from GO_M_DISRUPTED_01 using discriminating ISA-guided transform.",
   "parent_dataset_version": "1.0.0",
   "observational_noise_model_id": "pequiflux_observed_noise_v1_1",
-  "observational_noise_seed": 1484664011,
-  "parent_instance_id": "GO_M_BALANCED_02",
+  "observational_noise_seed": 2973051118,
+  "parent_instance_id": "GO_M_DISRUPTED_01",
   "child_type": "discriminating",
-  "generation_intensity": 0.18
+  "generation_intensity": 0.28
 }

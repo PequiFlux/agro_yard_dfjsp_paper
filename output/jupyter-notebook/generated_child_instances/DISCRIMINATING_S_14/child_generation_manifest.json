@@ -1,11 +1,11 @@
 {
   "candidate_id": "DISCRIMINATING_S_14",
-  "parent_instance_id": "GO_S_PEAK_03",
+  "parent_instance_id": "GO_S_DISRUPTED_02",
   "child_type": "discriminating",
   "scale_code": "S",
-  "regime_code": "peak",
-  "family_rank": 2,
-  "generation_intensity": 0.28,
+  "regime_code": "disrupted",
+  "family_rank": 1,
+  "generation_intensity": 0.18,
   "proposal_rule": "expandir regi\u00f5es com maior spread entre m\u00e9todos",
   "target_recommendation": "acentuar flexibilidade e regimes lim\u00edtrofes onde footprints se sobrep\u00f5em",
   "transform_meta": {
@@ -48,55 +48,55 @@
         1
       ],
       [
-        "J0008",
+        "J0016",
         1,
         2,
         1
       ],
       [
-        "J0008",
+        "J0016",
         3,
         3,
         1
       ],
       [
-        "J0008",
+        "J0016",
         4,
         2,
         1
       ],
       [
-        "J0009",
+        "J0017",
         1,
         2,
         1
       ],
       [
-        "J0009",
+        "J0017",
         3,
         2,
         1
       ],
       [
-        "J0009",
+        "J0017",
         4,
         2,
         1
       ],
       [
-        "J0010",
+        "J0018",
         1,
         2,
         1
       ],
       [
-        "J0010",
+        "J0018",
         3,
-        3,
+        2,
         1
       ],
       [
-        "J0010",
+        "J0018",
         4,
         2,
         1
@@ -164,7 +164,7 @@
       [
         "J0022",
         3,
-        3,
+        2,
         1
       ],
       [
@@ -200,7 +200,7 @@
       [
         "J0024",
         3,
-        3,
+        2,
         1
       ],
       [
@@ -265,8 +265,8 @@
       ]
     ],
     "hotspot_machines": [
-      "HOP1",
-      "HOP3"
+      "HOP3",
+      "HOP1"
     ]
   }
 }
