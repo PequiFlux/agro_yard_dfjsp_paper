@@ -132,12 +132,17 @@ Arquivos principais:
 Configuração esperada:
 
 - a licença Gurobi fica fora da imagem e é montada em runtime
-- o caminho padrão é `./gurobi.lic`
+- o caminho recomendado da licença é fora da árvore do repositório, por exemplo `~/.config/gurobi/gurobi.lic`
+- `GUROBI_LICENSE_FILE` deve apontar explicitamente para esse arquivo antes de subir os serviços
 - o serviço de notebook expõe JupyterLab na porta `8888`
+- `JUPYTER_TOKEN` deve ser definido explicitamente com um valor forte antes de subir `paper-notebook`
 
 Fluxo de uso:
 
 ```bash
+cp .env.example .env
+export GUROBI_LICENSE_FILE="$HOME/.config/gurobi/gurobi.lic"
+export JUPYTER_TOKEN="defina-um-token-forte"
 docker compose build
 docker compose run --rm paper-check
 docker compose up paper-notebook
@@ -159,8 +164,8 @@ stack analítico dentro do container.
 
 Variáveis de ambiente suportadas:
 
-- `GUROBI_LICENSE_FILE`
-- `JUPYTER_TOKEN`
+- `GUROBI_LICENSE_FILE`: caminho absoluto da licença Gurobi fora do repositório
+- `JUPYTER_TOKEN`: token obrigatório para expor o JupyterLab
 - `GUROBI_MAX_CONCURRENT_MODELS`
 - `NOTEBOOK_PATH`
 - `NOTEBOOK_EXECUTION_TIMEOUT`

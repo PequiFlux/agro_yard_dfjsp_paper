@@ -8,12 +8,16 @@ if [[ ! -f "${GRB_LICENSE_FILE:-/licenses/gurobi.lic}" ]]; then
   exit 1
 fi
 
+if [[ -z "${JUPYTER_TOKEN:-}" ]]; then
+  echo "Missing JUPYTER_TOKEN. Set a strong token before starting paper-notebook." >&2
+  exit 1
+fi
+
 exec jupyter lab \
   --ip=0.0.0.0 \
   --port=8888 \
   --no-browser \
   --ServerApp.root_dir=/workspace \
   --LabApp.default_url=/lab/tree/output/jupyter-notebook \
-  --ServerApp.token="${JUPYTER_TOKEN:-paper-local-token}" \
+  --ServerApp.token="${JUPYTER_TOKEN}" \
   --ServerApp.allow_origin='*'
-

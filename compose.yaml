@@ -11,17 +11,18 @@ x-paper-service: &paper-service
     PYTHONPATH: /workspace
     HOME: /home/paper
     GRB_LICENSE_FILE: /licenses/gurobi.lic
-    JUPYTER_TOKEN: ${JUPYTER_TOKEN:-paper-local-token}
     GUROBI_MAX_CONCURRENT_MODELS: ${GUROBI_MAX_CONCURRENT_MODELS:-2}
     NOTEBOOK_PATH: ${NOTEBOOK_PATH:-output/jupyter-notebook/agro-yard-paper-benchmark-and-selection.ipynb}
     NOTEBOOK_EXECUTION_TIMEOUT: ${NOTEBOOK_EXECUTION_TIMEOUT:-1800}
   volumes:
     - .:/workspace:z
-    - ${GUROBI_LICENSE_FILE:-./gurobi.lic}:/licenses/gurobi.lic:ro,z
+    - ${GUROBI_LICENSE_FILE:?Set GUROBI_LICENSE_FILE to an external gurobi.lic path}:/licenses/gurobi.lic:ro,z
 
 services:
   paper-notebook:
     <<: *paper-service
+    environment:
+      JUPYTER_TOKEN: ${JUPYTER_TOKEN:?Set JUPYTER_TOKEN to a strong value for paper-notebook}
     ports:
       - "8888:8888"
     command: ["/opt/paper/docker/start_jupyter.sh"]
