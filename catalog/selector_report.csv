@@ -1,0 +1,4 @@
+model_name,top1_accuracy,macro_f1,balanced_accuracy
+decision_tree,1.0,1.0,1.0
+random_forest,1.0,1.0,1.0
+lightgbm,1.0,1.0,1.0

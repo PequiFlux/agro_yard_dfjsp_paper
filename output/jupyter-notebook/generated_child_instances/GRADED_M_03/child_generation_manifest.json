@@ -1,0 +1,15 @@
+{
+  "candidate_id": "GRADED_M_03",
+  "parent_instance_id": "GO_M_BALANCED_01",
+  "child_type": "graded",
+  "scale_code": "M",
+  "regime_code": "balanced",
+  "family_rank": 1,
+  "generation_intensity": 0.14,
+  "proposal_rule": "interpolar dificuldade entre pais f\u00e1ceis e dif\u00edceis",
+  "target_recommendation": "aumentar reveal_span, congestion_mean e downtime_total_min em passos pequenos",
+  "transform_meta": {
+    "bottleneck_machine": "HOP4",
+    "added_downtime_min": 29
+  }
+}

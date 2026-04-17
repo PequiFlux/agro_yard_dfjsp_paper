@@ -1,0 +1,6 @@
+{
+  "makespan_min": 1641,
+  "mean_flow_min": 710.21,
+  "p95_flow_min": 1076,
+  "overwait_share": 0.8125
+}

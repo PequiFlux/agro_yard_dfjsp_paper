@@ -17,12 +17,12 @@
 - Instance-space duplicate-like checks pass: `True`
 - Instance-space nearest-neighbor distance min: `2.3228`
 - Job due-layer C2ST AUC mean: `0.7777`
-- Proc-time layer C2ST AUC mean: `0.5980`
+- Proc-time layer C2ST AUC mean: `0.6079`
 - Tail flow p99 regime checks pass: `False`
 - Tail queue p99 regime checks pass: `False`
 - Tail due-margin p05 regime checks pass: `False`
 - Solver smoke small cases optimal: `True`
 - Solver smoke all cases have solution: `True`
 - Solver smoke large cases show non-trivial gap: `True`
-- Solver smoke gap ladder pass: `False`
+- Solver smoke gap ladder pass: `True`
 - Official role: `base_dataset_for_g2milp_instance_generation`

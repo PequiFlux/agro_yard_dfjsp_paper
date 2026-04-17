@@ -1,0 +1,3 @@
+protocol_role,protocol_fold,n_instances,n_families
+calibration,R01,12,12
+test,R02_R03,24,12
